@@ -26,7 +26,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    async xwith_session = aiohttp.ClientSession()
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, headers=headers) as response:
@@ -37,17 +36,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text_result = soup.get_text()
 
                     if "valid" in text_result.lower():
-                        # استخراج البيانات بدقة من الجداول أو النصوص داخل الصفحة
                         bank_name = "غير متوفر"
                         bic = "غير متوفر"
-                        city = "غير متوفر"
                         
                         sepa_ct = "❌ غير مدعوم"
                         sepa_inst = "❌ غير مدعوم"
                         sepa_dd = "❌ غير مدعوم"
                         b2b = "❌ غير مدعوم"
 
-                        # البحث عن الكلمات المفتاحية في النص المستخرج
                         lines = [line.strip() for line in text_result.split('\n') if line.strip()]
                         
                         for i, line in enumerate(lines):
@@ -58,11 +54,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 parts = line.split("BIC:")
                                 if len(parts) > 1 and len(parts[1].strip()) > 0:
                                     bic = parts[1].strip()
-                            elif bic == "غير متوفر" and len(line) == 8 or len(line) == 11:
-                                # محاولة التقاط الـ BIC إذا كان محرضاً بشكل مباشر
-                                pass
 
-                        # البحث المباشر في الجداول أو الحقول لجلب الـ SEPA
                         full_text_lower = text_result.lower()
                         
                         if "sepa credit transfer is supported" in full_text_lower:
@@ -74,14 +66,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if "b2b is supported" in full_text_lower:
                             b2b = "✅ مدعوم (Supported)"
 
-                        # استخراج الـ BIC بطريقة بديلة إذا لم يظهر
                         if bic == "غير متوفر":
                             for line in lines:
-                                if "REVOLT" in line or "FGB" in line or len(line) == 11 and line[:4].isalpha():
+                                if len(line) == 11 and line[:4].isalpha():
                                     bic = line
                                     break
 
-                        # تصحيح اسم البنك حسب الـ IBAN إن لم يتم التقاطه بدقة
                         if iban.startswith("LT") and "32500" in iban:
                             bank_name = "Revolut Bank UAB (Payments)"
                             bic = "REVOLT21XXX" if bic == "غير متوفر" else bic
@@ -102,7 +92,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         result_text = "❌ **هذا الـ IBAN غير صالح أو وهمي!**"
                     
-                    await wait_msg.edit_text(result_text, parse_message="Markdown")
+                    await wait_msg.edit_text(result_text, parse_mode="Markdown")
                 else:
                     await wait_msg.edit_text("⚠️ تعذر الاتصال بموقع الفحص.")
         except Exception as e:
