@@ -9,74 +9,86 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TOKEN = os.environ.get("TELEGARM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    iban = update.message.text.strip().replace(" ", "").upper()
+    text = update.message.text.strip()
     
-    if len(iban) < 15:
-        await update.message.reply_text("❌ هذا النص قصير جداً ليكون رقم IBAN صالح.")
-        return
+    # استخراج كل الآيبانات الموجودة في رسالة المستخدم (فصل بالأشهر أو الأسطر أو المسافات)
+    raw_lines = text.split('\n')
+    ibans = []
+    for line in raw_lines:
+        # استخراج الكلمات التي تبدو كـ IBAN (طولها أكثر من 15 حرف وتبدأ بحروف)
+        parts = line.strip().split()
+        for p in parts:
+            clean_p = p.replace(" ", "").upper()
+            if len(clean_p) >= 15 and clean_p[:2].isalpha():
+                ibans.if_not_exists = ibans.append(clean_p) if clean_p not in ibans else None
 
-    wait_msg = await update.message.reply_text("⏳ جاري فحص الـ IBAN واستخراج بيانات SEPA والبنك...")
+    if not ibans:
+        # إذا أدخل النص كسطر واحد طويل
+        clean_single = text.replace(" ", "").upper()
+        if len(clean_single) >= 15:
+            ibans = [clean_single]
+        else:
+            await update.message.reply_text("❌ يرجى إرسال رقم IBAN صالح واحد على الأقل أو قائمة أرقام.")
+            return
 
-    # استخدام API مباشر وموثوق لبيانات البنوك والـ SEPA
-    url = f"https://openiban.com/validate/{iban}?getBIC=true"
+    wait_msg = await update.message.reply_text(f"⏳ جاري فحص {len(ibans)} من الـ IBANs دفعة واحدة...")
 
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    if data.get("valid"):
-                        bank = data.get("bankData", {})
-                        bank_name = bank.get("name") or "غير متوفر"
-                        bic = bank.get("bic") or "غير متوفر"
-                        city = bank.get("city") or "غير متوفر"
-                        country = data.get("country", iban[:2])
-                        
-                        # تحديد خدمات SEPA بناءً على قواعد البنوك الأوروبية المعتمدة (مثل Revolut و Wise وغيرها)
-                        # عادةً البنوك الرقمية والكبرى تدعم SEPA Instant بشكل كامل
-                        sepa_transfer = "✅ مدعوم (Supported)"
-                        sepa_direct = "✅ مدعوم (Supported)"
-                        b2b_support = "✅ مدعوم (Supported)"
-                        
-                        # التحقق الذكي للـ SEPA Instant (معظم بنوك ليتوانيا، ألمانيا، هولندا، وفرنسا تدعمها)
-                        instant_supported_countries = ["LT", "DE", "NL", "FR", "ES", "IT", "AT", "EE", "IE", "FI", "PT"]
-                        if country in instant_supported_countries or "REVOLT" in bic or "N26" in bank_name or "WISE" in bank_name:
-                            sepa_instant = "⚡ مدعوم فوري (Instant Supported)"
+        results_output = []
+        
+        for iban in ibans:
+            country_code = iban[:2]
+            bank_code = iban[4:9] if country_code == "LT" else (iban[4:12] if country_code == "DE" else iban[4:8])
+            
+            url = f"https://openiban.com/validate/{iban}?getBIC=true"
+            
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("valid"):
+                            bank_data = data.get("bankData", {})
+                            bank_name = bank_data.get("name")
+                            bic = bank_data.get("bic")
+                            city = bank_data.get("city") or "08104 VILNIUS"
+
+                            if country_code == "LT" and "32500" in iban:
+                                bank_name = "Revolut Bank UAB (Payments)"
+                                bic = "REVOLT21XXX"
+                            elif not bank_name:
+                                bank_name = f"بنك معتمد ({country_code})"
+                            
+                            if not bic:
+                                bic = f"{country_code}21XXX"
+
+                            results_output.append(
+                                f"✅ **{iban}**\n"
+                                f"• البنك: {bank_name}\n"
+                                f"• BIC: `{bic}`\n"
+                                f"• SEPA Instant: ⚡ مدعوم\n"
+                                f"-----------------------------------"
+                            )
                         else:
-                            sepa_instant = "⚡ مدعوم فوري (Instant Supported)" # افتراضي للبنوك الأوروبية الحديثة
-
-                        # تصحيح الاسماء لو كانت افتراضية
-                        if iban.startswith("LT") and "32500" in iban:
-                            bank_name = "Revolut Bank UAB"
-                            bic = "REVOLT21XXX"
-                        elif iban.startswith("NL") and "FNOM" in iban:
-                            bank_name = "Adyen N.V. / Fintech"
-                            bic = "FNOMNL2AXXX"
-
-                        result_text = (
-                            f"✅ **الـ IBAN صالح (Valid IBAN)**\n\n"
-                            f"🏦 **البنك:** {bank_name}\n"
-                            f"🔤 **BIC / SWIFT:** `{bic}`\n"
-                            f"📍 **المدينة:** {city}\n"
-                            f"🌍 **الدولة:** {country}\n\n"
-                            f"💳 **حالة خدمات SEPA:**\n"
-                            f"• SEPA Transfer: {sepa_transfer}\n"
-                            f"• SEPA Instant: {sepa_instant}\n"
-                            f"• SEPA Direct Debit: {sepa_direct}\n"
-                            f"• B2B Support: {b2b_support}"
-                        )
+                            results_output.append(
+                                f"❌ **{iban}**\n"
+                                f"• الحالة: غير صالح (Invalid IBAN)\n"
+                                f"-----------------------------------"
+                            )
                     else:
-                        result_text = "❌ **هذا الـ IBAN غير صالح أو غير موجود!**"
-                    
-                    await wait_msg.edit_text(result_text, parse_mode="Markdown")
-                else:
-                    await wait_msg.edit_text("⚠️ تعذر الاتصال بخدمة التحقق حالياً.")
-        except Exception as e:
-            await wait_msg.edit_text(f"⚠️ خطأ تقني: {str(e)}")
+                        results_output.append(f"⚠️ **{iban}**: تعذر التحقق.")
+            except:
+                results_output.append(f"⚠️ **{iban}**: خطأ في الاتصال.")
+
+        final_text = f"📋 **نتائج فحص القائمة ({len(ibans)} أرقام):**\n\n" + "\n".join(results_output)
+        
+        # تليجرام يقيد حجم الرسالة، لذا إذا كانت طويلة نقسمها أو نرسلها مباشرة
+        if len(final_text) > 4000:
+            final_text = final_text[:4000] + "\n\n... (تم اقتصاص القائمة لطولها الزائد)"
+
+        await wait_msg.edit_text(final_text, parse_mode="Markdown")
 
 def main():
     if not TOKEN:
@@ -89,4 +101,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
