@@ -14,19 +14,17 @@ TOKEN = os.environ.get("TELEGARM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOK
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
-    # استخراج كل الآيبانات الموجودة في رسالة المستخدم (فصل بالأشهر أو الأسطر أو المسافات)
     raw_lines = text.split('\n')
     ibans = []
     for line in raw_lines:
-        # استخراج الكلمات التي تبدو كـ IBAN (طولها أكثر من 15 حرف وتبدأ بحروف)
         parts = line.strip().split()
         for p in parts:
             clean_p = p.replace(" ", "").upper()
             if len(clean_p) >= 15 and clean_p[:2].isalpha():
-                ibans.if_not_exists = ibans.append(clean_p) if clean_p not in ibans else None
+                if clean_p not in ibans:
+                    ibans.append(clean_p)
 
     if not ibans:
-        # إذا أدخل النص كسطر واحد طويل
         clean_single = text.replace(" ", "").upper()
         if len(clean_single) >= 15:
             ibans = [clean_single]
@@ -41,8 +39,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for iban in ibans:
             country_code = iban[:2]
-            bank_code = iban[4:9] if country_code == "LT" else (iban[4:12] if country_code == "DE" else iban[4:8])
-            
             url = f"https://openiban.com/validate/{iban}?getBIC=true"
             
             try:
@@ -65,7 +61,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 bic = f"{country_code}21XXX"
 
                             results_output.append(
-                                f"✅ **{iban}**\n"
+                                f"✅ `{iban}`\n"
                                 f"• البنك: {bank_name}\n"
                                 f"• BIC: `{bic}`\n"
                                 f"• SEPA Instant: ⚡ مدعوم\n"
@@ -73,18 +69,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                         else:
                             results_output.append(
-                                f"❌ **{iban}**\n"
+                                f"❌ `{iban}`\n"
                                 f"• الحالة: غير صالح (Invalid IBAN)\n"
                                 f"-----------------------------------"
                             )
                     else:
-                        results_output.append(f"⚠️ **{iban}**: تعذر التحقق.")
+                        results_output.append(f"⚠️ `{iban}`: تعذر التحقق.")
             except:
-                results_output.append(f"⚠️ **{iban}**: خطأ في الاتصال.")
+                results_output.append(f"⚠️ `{iban}`: خطأ في الاتصال.")
 
         final_text = f"📋 **نتائج فحص القائمة ({len(ibans)} أرقام):**\n\n" + "\n".join(results_output)
         
-        # تليجرام يقيد حجم الرسالة، لذا إذا كانت طويلة نقسمها أو نرسلها مباشرة
         if len(final_text) > 4000:
             final_text = final_text[:4000] + "\n\n... (تم اقتصاص القائمة لطولها الزائد)"
 
