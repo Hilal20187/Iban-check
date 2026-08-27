@@ -14,10 +14,9 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     iban = update.message.text.strip().replace(" ", "")
     
-    # رسالة مؤقتة لتخفيف الانتظار
+    # رسالة مؤقتة للانتظار
     wait_msg = await update.message.reply_text("⏳ جاري فحص الـ IBAN وجلب المعلومات...")
 
-    # استخدام API مجاني وسريع لفحص الـ IBAN
     api_url = f"https://openiban.com/validate/{iban}?getBIC=true"
 
     async with aiohttp.ClientSession() as session:
