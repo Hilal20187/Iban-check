@@ -45,15 +45,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if response.status == 200:
                         data = await response.json()
                         
-                        # التحقق الفعلي من الـ API
                         if data.get("valid") == True:
                             bank_data = data.get("bankData", {})
                             bank_name = bank_data.get("name") or "غير متوفر"
                             bic = bank_data.get("bic") or "غير متوفر"
                             city = bank_data.get("city") or "غير متوفر"
                             
-                            # فحص دقيق لخدمات SEPA إذا توفرت في الـ API أو بناءً على خصائص البنك الحقيقية
-                            # البنوك الرقمية الكبرى غالباً تدعم الفوري، والبقية حسب البيانات الفعلية
                             sepa_instant_supported = False
                             instant_keywords = ["REVOLT", "N26", "WISE", "PBNK", "DEUT", "COBA"]
                             if any(k in bic.upper() for k in instant_keywords) or any(k in bank_name.upper() for k in ["REVOLT", "N26", "WISE"]):
@@ -92,6 +89,11 @@ def main():
         return
 
     application = ApplicationBuilder().token(TOKEN).build()
+    
+    # مسح أي اتصال أو ويبهوك قديم معلق على التوكن
+    import requests
+    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
+
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     application.run_polling()
