@@ -11,6 +11,15 @@ logging.basicConfig(
 
 TOKEN = os.environ.get("TELEGARM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 
+async def delete_webhook_safely(token):
+    url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=true"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as resp:
+                pass
+        except:
+            pass
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
@@ -88,12 +97,10 @@ def main():
     if not TOKEN:
         return
 
-    application = ApplicationBuilder().token(TOKEN).build()
-    
-    # مسح أي اتصال أو ويبهوك قديم معلق على التوكن
-    import requests
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=true")
+    import asyncio
+    asyncio.run(delete_webhook_safely(TOKEN))
 
+    application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     application.run_polling()
