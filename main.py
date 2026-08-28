@@ -888,9 +888,7 @@ def format_result(data):
         f"{support_text(data.get('instant'))}\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "ℹ️ المصدر: IBAN Calculator\n"
-        "⚠️ صلاحية IBAN لا تعني أن الحساب "
-        "مفتوح أو يحتوي على رصيد."
+"By LEX"
     )
 
 
