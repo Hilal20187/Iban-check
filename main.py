@@ -3,26 +3,37 @@ import re
 import asyncio
 import logging
 from html import escape
+from http import HTTPStatus
 
 import aiohttp
 from bs4 import BeautifulSoup
+import uvicorn
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
 # =========================================================
-# CONFIG
+# CONFIGURATION
 # =========================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+WEBHOOK_SECRET = os.getenv(
+    "TELEGRAM_WEBHOOK_SECRET",
+    ""
+)
 
 BASE_URL = "https://www.ibancalculator.com/validate/"
 
@@ -35,19 +46,29 @@ logger = logging.getLogger("LEX-IBAN-BOT")
 
 
 # =========================================================
-# IBAN
+# IBAN FUNCTIONS
 # =========================================================
 
 def clean_iban(value: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", value.upper())
+    return re.sub(
+        r"[^A-Z0-9]",
+        "",
+        value.upper()
+    )
 
 
 def extract_ibans(text: str):
     found = []
 
-    pattern = r"\b[A-Z]{2}\s*[0-9]{2}(?:[\sA-Z0-9]{10,40})\b"
+    pattern = (
+        r"\b[A-Z]{2}\s*[0-9]{2}"
+        r"(?:[\sA-Z0-9]{10,40})\b"
+    )
 
-    for match in re.findall(pattern, text.upper()):
+    for match in re.findall(
+        pattern,
+        text.upper()
+    ):
         iban = clean_iban(match)
 
         if (
@@ -60,8 +81,8 @@ def extract_ibans(text: str):
         ):
             found.append(iban)
 
-    # Fallback
     for word in text.split():
+
         iban = clean_iban(word)
 
         if (
@@ -78,26 +99,35 @@ def extract_ibans(text: str):
 
 
 def iban_checksum_valid(iban: str) -> bool:
+
     try:
         rearranged = iban[4:] + iban[:4]
 
         numeric = ""
 
         for char in rearranged:
+
             if char.isdigit():
                 numeric += char
 
             elif char.isalpha():
-                numeric += str(ord(char) - 55)
+                numeric += str(
+                    ord(char) - 55
+                )
 
             else:
                 return False
 
         remainder = 0
 
-        for i in range(0, len(numeric), 7):
+        for i in range(
+            0,
+            len(numeric),
+            7
+        ):
             remainder = int(
-                str(remainder) + numeric[i:i + 7]
+                str(remainder)
+                + numeric[i:i + 7]
             ) % 97
 
         return remainder == 1
@@ -107,17 +137,23 @@ def iban_checksum_valid(iban: str) -> bool:
 
 
 # =========================================================
-# HTML
+# HTML PARSING
 # =========================================================
 
 def get_clean_soup(html: str):
+
     soup = BeautifulSoup(
         html,
         "html.parser"
     )
 
     for tag in soup.find_all(
-        ["script", "style", "noscript", "svg"]
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg"
+        ]
     ):
         tag.decompose()
 
@@ -125,6 +161,7 @@ def get_clean_soup(html: str):
 
 
 def clean_value(value):
+
     if not value:
         return None
 
@@ -142,6 +179,7 @@ def clean_value(value):
 
 
 def is_bad_value(value):
+
     if not value:
         return True
 
@@ -156,7 +194,6 @@ def is_bad_value(value):
         "unknown",
         "nicht verfügbar",
         "nicht gefunden",
-        "غير متوفر",
     }
 
     if low in bad_values:
@@ -172,8 +209,8 @@ def is_bad_value(value):
     ]
 
     if any(
-        x in low
-        for x in bad_fragments
+        item in low
+        for item in bad_fragments
     ):
         return True
 
@@ -184,14 +221,13 @@ def get_label_value(
     soup,
     labels
 ):
+
     labels_lower = {
-        x.lower().strip()
-        for x in labels
+        item.lower().strip()
+        for item in labels
     }
 
-    # -----------------------------------------------------
-    # TABLE
-    # -----------------------------------------------------
+    # Table extraction
 
     for row in soup.find_all("tr"):
 
@@ -212,7 +248,10 @@ def get_label_value(
         if not label:
             continue
 
-        if label.lower().rstrip(":") in labels_lower:
+        if (
+            label.lower().rstrip(":")
+            in labels_lower
+        ):
 
             value = clean_value(
                 cells[1].get_text(
@@ -224,9 +263,7 @@ def get_label_value(
             if not is_bad_value(value):
                 return value
 
-    # -----------------------------------------------------
-    # LABEL / DT
-    # -----------------------------------------------------
+    # Definition list extraction
 
     for element in soup.find_all(
         ["label", "dt"]
@@ -242,7 +279,10 @@ def get_label_value(
         if not label:
             continue
 
-        if label.lower().rstrip(":") not in labels_lower:
+        if (
+            label.lower().rstrip(":")
+            not in labels_lower
+        ):
             continue
 
         sibling = element.find_next_sibling()
@@ -259,9 +299,7 @@ def get_label_value(
             if not is_bad_value(value):
                 return value
 
-    # -----------------------------------------------------
-    # STRONG / B
-    # -----------------------------------------------------
+    # Strong / bold labels
 
     for element in soup.find_all(
         ["strong", "b"]
@@ -277,7 +315,10 @@ def get_label_value(
         if not label:
             continue
 
-        if label.lower().rstrip(":") not in labels_lower:
+        if (
+            label.lower().rstrip(":")
+            not in labels_lower
+        ):
             continue
 
         parent = element.parent
@@ -303,9 +344,7 @@ def get_label_value(
                 if not is_bad_value(value):
                     return value
 
-    # -----------------------------------------------------
-    # EXACT LABEL: VALUE
-    # -----------------------------------------------------
+    # Exact label:value extraction
 
     for element in soup.find_all(
         ["p", "div", "li", "span"]
@@ -348,7 +387,7 @@ def get_label_value(
 
 
 # =========================================================
-# BANK
+# BANK DATA
 # =========================================================
 
 def extract_bank(soup):
@@ -371,10 +410,6 @@ def extract_bank(soup):
 
     return value
 
-
-# =========================================================
-# BIC
-# =========================================================
 
 def extract_bic(soup):
 
@@ -409,10 +444,6 @@ def extract_bic(soup):
     return bic
 
 
-# =========================================================
-# BRANCH
-# =========================================================
-
 def extract_branch(soup):
 
     value = get_label_value(
@@ -429,10 +460,6 @@ def extract_branch(soup):
 
     return value
 
-
-# =========================================================
-# ADDRESS
-# =========================================================
 
 def extract_address(soup):
 
@@ -454,7 +481,12 @@ def extract_address(soup):
         return None
 
     elements = soup.find_all(
-        ["p", "div", "td", "li"]
+        [
+            "p",
+            "div",
+            "td",
+            "li"
+        ]
     )
 
     for i, element in enumerate(elements):
@@ -515,13 +547,14 @@ def extract_address(soup):
 
 
 # =========================================================
-# SEPA
+# SEPA SUPPORT
 # =========================================================
 
 def detect_support(
     soup,
     phrases
 ):
+
     text = soup.get_text(
         " ",
         strip=True
@@ -539,7 +572,6 @@ def detect_support(
             phrase.lower()
         )
 
-        # Supported
         if re.search(
             p
             + r"\s+(?:is\s+)?supported\b",
@@ -548,7 +580,6 @@ def detect_support(
         ):
             return True
 
-        # Not supported
         if re.search(
             p
             + r"\s+(?:is\s+)?not\s+supported\b",
@@ -557,7 +588,6 @@ def detect_support(
         ):
             return False
 
-        # German
         if re.search(
             p
             + r".{0,40}"
@@ -580,13 +610,14 @@ def detect_support(
 
 
 # =========================================================
-# PARSE
+# PAGE PARSER
 # =========================================================
 
 def parse_result(
     html,
     iban
 ):
+
     soup = get_clean_soup(
         html
     )
@@ -612,61 +643,45 @@ def parse_result(
         "instant": None,
     }
 
-    # -----------------------------------------------------
-    # VALID
-    # -----------------------------------------------------
-
     if (
-        "this is a valid iban" in lower
-        or "this iban is valid" in lower
-        or "is a valid iban" in lower
-        or "dies ist eine gültige iban" in lower
+        "this is a valid iban"
+        in lower
+        or "this iban is valid"
+        in lower
+        or "is a valid iban"
+        in lower
+        or "dies ist eine gültige iban"
+        in lower
     ):
         result["valid"] = True
 
     elif (
-        "this is not a valid iban" in lower
-        or "this iban is invalid" in lower
-        or "this is an invalid iban" in lower
-        or "dies ist keine gültige iban" in lower
+        "this is not a valid iban"
+        in lower
+        or "this iban is invalid"
+        in lower
+        or "this is an invalid iban"
+        in lower
+        or "dies ist keine gültige iban"
+        in lower
     ):
         result["valid"] = False
-
-    # -----------------------------------------------------
-    # BANK
-    # -----------------------------------------------------
 
     result["bank"] = extract_bank(
         soup
     )
 
-    # -----------------------------------------------------
-    # BIC
-    # -----------------------------------------------------
-
     result["bic"] = extract_bic(
         soup
     )
-
-    # -----------------------------------------------------
-    # BRANCH
-    # -----------------------------------------------------
 
     result["branch"] = extract_branch(
         soup
     )
 
-    # -----------------------------------------------------
-    # ADDRESS
-    # -----------------------------------------------------
-
     result["address"] = extract_address(
         soup
     )
-
-    # -----------------------------------------------------
-    # SEPA
-    # -----------------------------------------------------
 
     result["sepa"] = detect_support(
         soup,
@@ -700,13 +715,14 @@ def parse_result(
 
 
 # =========================================================
-# CHECK WEBSITE
+# IBAN WEBSITE REQUEST
 # =========================================================
 
 async def check_iban(
     session,
     iban
 ):
+
     url = BASE_URL + iban
 
     headers = {
@@ -751,36 +767,38 @@ async def check_iban(
 
         return {
             "iban": iban,
-            "error": "انتهت مهلة الاتصال."
+            "error": "Request timeout."
         }
 
-    except Exception:
+    except Exception as error:
 
         logger.exception(
-            "IBAN request failed"
+            "IBAN request failed: %s",
+            error
         )
 
         return {
             "iban": iban,
             "error": (
-                "حدث خطأ أثناء الاتصال بالمصدر."
+                "Unable to contact "
+                "the IBAN source."
             )
         }
 
 
 # =========================================================
-# FORMAT
+# RESULT FORMAT
 # =========================================================
 
 def support_text(value):
 
     if value is True:
-        return "✅ مدعوم"
+        return "Supported"
 
     if value is False:
-        return "❌ غير مدعوم"
+        return "Not supported"
 
-    return "⚠️ غير محدد"
+    return "Unknown"
 
 
 def format_result(data):
@@ -792,50 +810,51 @@ def format_result(data):
     if data.get("error"):
 
         return (
-            "📋 <b>نتائج فحص IBAN</b>\n"
+            "📋 <b>IBAN Check Result</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🔢 <code>{iban}</code>\n\n"
-            "⚠️ تعذر الحصول على النتيجة.\n"
-            f"• السبب: {escape(data['error'])}\n\n"
+            "⚠️ Unable to get the result.\n"
+            f"• Reason: "
+            f"{escape(data['error'])}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "By LEX"
         )
 
     if data.get("valid") is True:
 
-        status = "✅ صالح"
+        status = "Valid"
 
     elif data.get("valid") is False:
 
-        status = "❌ غير صالح"
+        status = "Invalid"
 
     else:
 
         if iban_checksum_valid(
             data["iban"]
         ):
-            status = "⚠️ صالح فنيًا"
+            status = "Technically valid"
         else:
-            status = "❌ غير صالح فنيًا"
+            status = "Technically invalid"
 
     bank = escape(
         data.get("bank")
-        or "غير متوفر"
+        or "Not available"
     )
 
     bic = escape(
         data.get("bic")
-        or "غير متوفر"
+        or "Not available"
     )
 
     branch = escape(
         data.get("branch")
-        or "غير متوفر"
+        or "Not available"
     )
 
     address = (
         data.get("address")
-        or "غير متوفر"
+        or "Not available"
     )
 
     address = escape(
@@ -847,23 +866,23 @@ def format_result(data):
 
     country = escape(
         data.get("country")
-        or "غير متوفر"
+        or "Not available"
     )
 
     return (
-        "📋 <b>نتائج فحص IBAN</b>\n"
+        "📋 <b>IBAN Check Result</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
         f"🔢 <code>{iban}</code>\n\n"
 
-        f"• الحالة: <b>{status}</b>\n"
-        f"• الدولة: <b>{country}</b>\n\n"
+        f"• Status: <b>{status}</b>\n"
+        f"• Country: <b>{country}</b>\n\n"
 
-        "🏦 <b>بيانات البنك</b>\n"
-        f"• البنك: {bank}\n"
+        "🏦 <b>Bank Information</b>\n"
+        f"• Bank: {bank}\n"
         f"• BIC/SWIFT: "
         f"<code>{bic}</code>\n"
-        f"• العنوان: {address}\n"
+        f"• Address: {address}\n"
         f"• Branch: "
         f"<code>{branch}</code>\n\n"
 
@@ -906,8 +925,7 @@ async def handle_message(
     if not ibans:
 
         await update.message.reply_text(
-            "❌ لم أجد IBAN صالحًا.\n\n"
-            "أرسل IBAN واحد أو قائمة IBANs."
+            "❌ No valid IBAN found."
         )
 
         return
@@ -915,13 +933,15 @@ async def handle_message(
     if len(ibans) > 10:
 
         await update.message.reply_text(
-            "❌ الحد الأقصى هو 10 IBANs."
+            "❌ Maximum 10 IBANs per message."
         )
 
         return
 
-    wait = await update.message.reply_text(
-        f"⏳ جاري فحص {len(ibans)} IBAN..."
+    wait_message = (
+        await update.message.reply_text(
+            f"⏳ Checking {len(ibans)} IBAN(s)..."
+        )
     )
 
     async with aiohttp.ClientSession() as session:
@@ -950,12 +970,12 @@ async def handle_message(
 
         final_text = (
             final_text[:3900]
-            + "\n\n⚠️ تم اختصار النتائج."
+            + "\n\n⚠️ Results truncated."
         )
 
     try:
 
-        await wait.edit_text(
+        await wait_message.edit_text(
             final_text,
             parse_mode="HTML"
         )
@@ -969,20 +989,97 @@ async def handle_message(
 
 
 # =========================================================
-# START WEBHOOK
+# WEBHOOK SERVER
 # =========================================================
 
-def main():
+application = None
+
+
+async def telegram_webhook(
+    request: Request
+):
+
+    if WEBHOOK_SECRET:
+
+        received_secret = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            ""
+        )
+
+        if received_secret != WEBHOOK_SECRET:
+
+            return PlainTextResponse(
+                "Unauthorized",
+                status_code=HTTPStatus.UNAUTHORIZED
+            )
+
+    try:
+
+        data = await request.json()
+
+        update = Update.de_json(
+            data=data,
+            bot=application.bot
+        )
+
+        await application.update_queue.put(
+            update
+        )
+
+        return PlainTextResponse(
+            "OK",
+            status_code=HTTPStatus.OK
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Webhook error: %s",
+            error
+        )
+
+        return PlainTextResponse(
+            "Bad Request",
+            status_code=HTTPStatus.BAD_REQUEST
+        )
+
+
+async def health_check(
+    request: Request
+):
+
+    return PlainTextResponse(
+        "LEX IBAN Bot is running.",
+        status_code=HTTPStatus.OK
+    )
+
+
+async def root(
+    request: Request
+):
+
+    return PlainTextResponse(
+        "LEX IBAN Bot",
+        status_code=HTTPStatus.OK
+    )
+
+
+# =========================================================
+# APPLICATION STARTUP
+# =========================================================
+
+async def run_server():
+
+    global application
 
     if not TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN غير موجود "
-            "في Environment Variables."
+            "TELEGRAM_BOT_TOKEN is not set."
         )
 
     if not RENDER_EXTERNAL_URL:
         raise RuntimeError(
-            "RENDER_EXTERNAL_URL غير موجود."
+            "RENDER_EXTERNAL_URL is not set."
         )
 
     webhook_url = (
@@ -990,18 +1087,10 @@ def main():
         + "/telegram"
     )
 
-    logger.info(
-        "Starting LEX IBAN bot..."
-    )
-
-    logger.info(
-        "Webhook URL: %s",
-        webhook_url
-    )
-
     application = (
-        ApplicationBuilder()
+        Application.builder()
         .token(TOKEN)
+        .updater(None)
         .build()
     )
 
@@ -1013,14 +1102,91 @@ def main():
         )
     )
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="telegram",
-        webhook_url=webhook_url,
-        drop_pending_updates=True,
+    routes = [
+        Route(
+            "/",
+            root,
+            methods=["GET"]
+        ),
+        Route(
+            "/health",
+            health_check,
+            methods=["GET"]
+        ),
+        Route(
+            "/telegram",
+            telegram_webhook,
+            methods=["POST"]
+        ),
+    ]
+
+    web_app = Starlette(
+        routes=routes
     )
 
+    config = uvicorn.Config(
+        web_app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+    )
+
+    server = uvicorn.Server(
+        config
+    )
+
+    async with application:
+
+        await application.start()
+
+        if WEBHOOK_SECRET:
+
+            await application.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+
+        else:
+
+            await application.bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+
+        logger.info(
+            "LEX IBAN Bot started."
+        )
+
+        logger.info(
+            "Webhook: %s",
+            webhook_url
+        )
+
+        logger.info(
+            "Health: %s/health",
+            RENDER_EXTERNAL_URL.rstrip("/")
+        )
+
+        try:
+
+            await server.serve()
+
+        finally:
+
+            await application.bot.delete_webhook()
+
+            await application.stop()
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
-    main() 
+
+    asyncio.run(
+        run_server()
+        ) 
