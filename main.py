@@ -1,14 +1,12 @@
 import os
 import re
-import csv
-import io
 import asyncio
 import logging
-from datetime import datetime
 
 import aiohttp
+from bs4 import BeautifulSoup
+
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -16,250 +14,60 @@ from telegram.ext import (
     filters,
 )
 
-# ============================================================
+# =========================================================
 # CONFIG
-# ============================================================
+# =========================================================
 
-TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TELEGARM_BOT_TOKEN")
-)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-MAX_IBANS = 50
-CONCURRENCY = 8
-TIMEOUT = 20
+SITE_URL = "https://www.ibancalculator.com/iban_validieren.html"
 
-EPC_SCT_CSV = (
-    "https://www.europeanpaymentscouncil.eu/"
-    "sites/default/files/participants_export/"
-    "sct/sct.csv"
-)
-
-EPC_SCT_INST_CSV = (
-    "https://www.europeanpaymentscouncil.eu/"
-    "sites/default/files/participants_export/"
-    "sct_inst/sct_inst.csv"
-)
+TIMEOUT = 30
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger("IBAN-BOT")
+logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# COUNTRIES
-# ============================================================
+# =========================================================
+# IBAN CLEAN
+# =========================================================
 
-COUNTRIES = {
-    "AD": "أندورا",
-    "AL": "ألبانيا",
-    "AT": "النمسا",
-    "BA": "البوسنة والهرسك",
-    "BE": "بلجيكا",
-    "BG": "بلغاريا",
-    "BY": "بيلاروسيا",
-    "CH": "سويسرا",
-    "CY": "قبرص",
-    "CZ": "التشيك",
-    "DE": "ألمانيا",
-    "DK": "الدنمارك",
-    "EE": "إستونيا",
-    "ES": "إسبانيا",
-    "FI": "فنلندا",
-    "FO": "جزر فارو",
-    "FR": "فرنسا",
-    "GB": "المملكة المتحدة",
-    "GE": "جورجيا",
-    "GI": "جبل طارق",
-    "GL": "جرينلاند",
-    "GR": "اليونان",
-    "HR": "كرواتيا",
-    "HU": "المجر",
-    "IE": "أيرلندا",
-    "IS": "آيسلندا",
-    "IT": "إيطاليا",
-    "LI": "ليختنشتاين",
-    "LT": "ليتوانيا",
-    "LU": "لوكسمبورغ",
-    "LV": "لاتفيا",
-    "MC": "موناكو",
-    "MD": "مولدوفا",
-    "ME": "الجبل الأسود",
-    "MK": "مقدونيا الشمالية",
-    "MT": "مالطا",
-    "NL": "هولندا",
-    "NO": "النرويج",
-    "PL": "بولندا",
-    "PT": "البرتغال",
-    "RO": "رومانيا",
-    "RS": "صربيا",
-    "SE": "السويد",
-    "SI": "سلوفينيا",
-    "SK": "سلوفاكيا",
-    "SM": "سان مارينو",
-    "TR": "تركيا",
-    "UA": "أوكرانيا",
-    "VA": "الفاتيكان",
-    "XK": "كوسوفو",
-}
+def clean_iban(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
 
 
-# ============================================================
-# IBAN LENGTHS
-# ============================================================
-
-IBAN_LENGTHS = {
-    "AD": 24,
-    "AL": 28,
-    "AT": 20,
-    "BA": 20,
-    "BE": 16,
-    "BG": 22,
-    "BY": 28,
-    "CH": 21,
-    "CY": 28,
-    "CZ": 24,
-    "DE": 22,
-    "DK": 18,
-    "EE": 20,
-    "ES": 24,
-    "FI": 18,
-    "FO": 18,
-    "FR": 27,
-    "GB": 22,
-    "GE": 22,
-    "GI": 23,
-    "GL": 18,
-    "GR": 27,
-    "HR": 21,
-    "HU": 28,
-    "IE": 22,
-    "IS": 26,
-    "IT": 27,
-    "LI": 21,
-    "LT": 20,
-    "LU": 20,
-    "LV": 21,
-    "MC": 27,
-    "MD": 24,
-    "ME": 22,
-    "MK": 19,
-    "MT": 31,
-    "NL": 18,
-    "NO": 15,
-    "PL": 28,
-    "PT": 25,
-    "RO": 24,
-    "RS": 22,
-    "SE": 24,
-    "SI": 19,
-    "SK": 24,
-    "SM": 27,
-    "TR": 26,
-    "UA": 29,
-    "VA": 22,
-    "XK": 20,
-}
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def clean(value):
-    return re.sub(
-        r"[^A-Z0-9]",
-        "",
-        str(value).upper(),
-    )
-
-
-def country_name(code):
-    return COUNTRIES.get(
-        code,
-        code,
-    )
-
-
-def format_iban(iban):
-    return " ".join(
-        iban[i:i + 4]
-        for i in range(0, len(iban), 4)
-    )
-
-
-def mod97_valid(iban):
-    """
-    ISO 13616 MOD-97.
-    """
-
-    rearranged = (
-        iban[4:]
-        + iban[:4]
-    )
-
-    numeric = ""
-
-    for char in rearranged:
-        if char.isdigit():
-            numeric += char
-        else:
-            numeric += str(
-                ord(char) - 55
-            )
-
-    remainder = 0
-
-    for i in range(
-        0,
-        len(numeric),
-        7,
-    ):
-        remainder = int(
-            str(remainder)
-            + numeric[i:i + 7]
-        ) % 97
-
-    return remainder == 1
-
-
-def extract_ibans(text):
+def extract_ibans(text: str):
     found = []
 
-    # IBAN with spaces
+    # IBANs with or without spaces
     candidates = re.findall(
-        r"\b[A-Za-z]{2}[0-9A-Za-z\s]{13,40}\b",
-        text,
+        r"\b[A-Z]{2}[0-9A-Z][A-Z0-9\s]{12,40}\b",
+        text.upper()
     )
 
     for candidate in candidates:
 
-        iban = clean(candidate)
+        iban = clean_iban(candidate)
 
         if (
             len(iban) >= 15
-            and re.match(
-                r"^[A-Z]{2}[0-9]",
-                iban,
-            )
+            and re.match(r"^[A-Z]{2}[0-9]{2}", iban)
             and iban not in found
         ):
             found.append(iban)
 
-    # fallback
-    for token in text.split():
+    # fallback for single IBAN
+    for word in text.split():
 
-        iban = clean(token)
+        iban = clean_iban(word)
 
         if (
             len(iban) >= 15
-            and re.match(
-                r"^[A-Z]{2}[0-9]",
-                iban,
-            )
+            and re.match(r"^[A-Z]{2}[0-9]{2}", iban)
             and iban not in found
         ):
             found.append(iban)
@@ -267,1119 +75,363 @@ def extract_ibans(text):
     return found
 
 
-# ============================================================
-# COUNTRY-SPECIFIC IBAN PARSER
-# ============================================================
+# =========================================================
+# MOD 97
+# =========================================================
 
-def parse_structure(iban):
+def check_mod97(iban: str) -> bool:
 
-    country = iban[:2]
-    result = {}
+    rearranged = iban[4:] + iban[:4]
 
-    # --------------------------------------------------------
-    # ITALY
-    # IT + 2 check + CIN + ABI + CAB + ACCOUNT
-    # --------------------------------------------------------
+    numeric = ""
 
-    if country == "IT" and len(iban) == 27:
+    for char in rearranged:
 
-        result["cin"] = iban[4]
-        result["abi"] = iban[5:10]
-        result["cab"] = iban[10:15]
-        result["account"] = iban[15:]
+        if char.isdigit():
+            numeric += char
+        else:
+            numeric += str(ord(char) - 55)
 
-    # --------------------------------------------------------
-    # GERMANY
-    # DE + check + BLZ(8) + account(10)
-    # --------------------------------------------------------
+    remainder = 0
 
-    elif country == "DE" and len(iban) == 22:
+    for i in range(0, len(numeric), 7):
 
-        result["blz"] = iban[4:12]
-        result["account"] = iban[12:]
+        remainder = int(
+            str(remainder) + numeric[i:i + 7]
+        ) % 97
 
-    # --------------------------------------------------------
-    # AUSTRIA
-    # AT + check + BLZ(5) + account(11)
-    # --------------------------------------------------------
+    return remainder == 1
 
-    elif country == "AT" and len(iban) == 20:
 
-        result["blz"] = iban[4:9]
-        result["account"] = iban[9:]
+# =========================================================
+# SCRAPE IBAN CALCULATOR
+# =========================================================
 
-    # --------------------------------------------------------
-    # FRANCE / MONACO
-    # Bank + Branch + Account + RIB key
-    # --------------------------------------------------------
+async def check_iban_online(
+    session,
+    iban: str,
+):
 
-    elif country in ("FR", "MC"):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/130.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-        result["bank_code"] = iban[4:9]
-        result["branch_code"] = iban[9:14]
-        result["account"] = iban[14:25]
-        result["rib_key"] = iban[25:27]
+    # The website accepts the IBAN as a query parameter
+    # used by its validation page.
+    params = {
+        "tx_valIBAN_pi1[iban]": iban,
+    }
 
-    # --------------------------------------------------------
-    # SPAIN
-    # Entity + Branch + Check + Account
-    # --------------------------------------------------------
+    try:
 
-    elif country == "ES":
+        async with session.get(
+            SITE_URL,
+            params=params,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(
+                total=TIMEOUT
+            ),
+        ) as response:
 
-        result["bank_code"] = iban[4:8]
-        result["branch_code"] = iban[8:12]
-        result["account_check"] = iban[12:14]
-        result["account"] = iban[14:24]
+            if response.status != 200:
 
-    # --------------------------------------------------------
-    # PORTUGAL
-    # Bank + Branch + Account + Check
-    # --------------------------------------------------------
-
-    elif country == "PT":
-
-        result["bank_code"] = iban[4:8]
-        result["branch_code"] = iban[8:12]
-        result["account"] = iban[12:23]
-        result["check"] = iban[23:25]
-
-    # --------------------------------------------------------
-    # BELGIUM
-    # Bank code + account + check
-    # --------------------------------------------------------
-
-    elif country == "BE":
-
-        result["bank_code"] = iban[4:7]
-        result["account"] = iban[7:14]
-        result["check"] = iban[14:16]
-
-    # --------------------------------------------------------
-    # NETHERLANDS
-    # 4 letters bank identifier + 10 account
-    # --------------------------------------------------------
-
-    elif country == "NL":
-
-        result["bank_code"] = iban[4:8]
-        result["account"] = iban[8:18]
-
-    # --------------------------------------------------------
-    # UNITED KINGDOM
-    # 4 letters bank + 6 sort code + 8 account
-    # --------------------------------------------------------
-
-    elif country == "GB":
-
-        result["bank_code"] = iban[4:8]
-        result["sort_code"] = iban[8:14]
-        result["account"] = iban[14:22]
-
-    # --------------------------------------------------------
-    # IRELAND
-    # 4 letters bank + 6 branch + account
-    # --------------------------------------------------------
-
-    elif country == "IE":
-
-        result["bank_code"] = iban[4:8]
-        result["branch_code"] = iban[8:14]
-        result["account"] = iban[14:22]
-
-    # --------------------------------------------------------
-    # SWITZERLAND
-    # 5-digit clearing + account
-    # --------------------------------------------------------
-
-    elif country == "CH":
-
-        result["clearing"] = iban[4:9]
-        result["account"] = iban[9:21]
-
-    # --------------------------------------------------------
-    # LIECHTENSTEIN
-    # 5-digit clearing + account
-    # --------------------------------------------------------
-
-    elif country == "LI":
-
-        result["clearing"] = iban[4:9]
-        result["account"] = iban[9:21]
-
-    # --------------------------------------------------------
-    # LITHUANIA
-    # 5-digit bank code + account
-    # --------------------------------------------------------
-
-    elif country == "LT":
-
-        result["bank_code"] = iban[4:9]
-        result["account"] = iban[9:20]
-
-    # --------------------------------------------------------
-    # LATVIA
-    # 4-letter bank + account
-    # --------------------------------------------------------
-
-    elif country == "LV":
-
-        result["bank_code"] = iban[4:8]
-        result["account"] = iban[8:21]
-
-    # --------------------------------------------------------
-    # ESTONIA
-    # 2 bank digits + account
-    # --------------------------------------------------------
-
-    elif country == "EE":
-
-        result["bank_code"] = iban[4:6]
-        result["account"] = iban[6:20]
-
-    # --------------------------------------------------------
-    # FINLAND
-    # bank/account BBAN
-    # --------------------------------------------------------
-
-    elif country == "FI":
-
-        result["bank_code"] = iban[4:10]
-        result["account"] = iban[10:18]
-
-    # --------------------------------------------------------
-    # DENMARK
-    # 4 bank + account
-    # --------------------------------------------------------
-
-    elif country == "DK":
-
-        result["bank_code"] = iban[4:8]
-        result["account"] = iban[8:18]
-
-    # --------------------------------------------------------
-    # NORWAY
-    # 4 bank + account
-    # --------------------------------------------------------
-
-    elif country == "NO":
-
-        result["bank_code"] = iban[4:8]
-        result["account"] = iban[8:15]
-
-    # --------------------------------------------------------
-    # SWEDEN
-    # 3 bank + account
-    # --------------------------------------------------------
-
-    elif country == "SE":
-
-        result["bank_code"] = iban[4:7]
-        result["account"] = iban[7:24]
-
-    # --------------------------------------------------------
-    # POLAND
-    # 8 bank/branch + 16 account
-    # --------------------------------------------------------
-
-    elif country == "PL":
-
-        result["bank_code"] = iban[4:12]
-        result["account"] = iban[12:28]
-
-    # --------------------------------------------------------
-    # CZECH REPUBLIC
-    # Prefix + bank code + account
-    # --------------------------------------------------------
-
-    elif country == "CZ":
-
-        result["bank_prefix"] = iban[4:10]
-        result["bank_code"] = iban[10:14]
-        result["account"] = iban[14:24]
-
-    # --------------------------------------------------------
-    # SLOVAKIA
-    # Prefix + bank code + account
-    # --------------------------------------------------------
-
-    elif country == "SK":
-
-        result["bank_prefix"] = iban[4:10]
-        result["bank_code"] = iban[10:14]
-        result["account"] = iban[14:24]
-
-    # --------------------------------------------------------
-    # HUNGARY
-    # bank + branch + account
-    # --------------------------------------------------------
-
-    elif country == "HU":
-
-        result["bank_code"] = iban[4:12]
-        result["branch_code"] = iban[12:16]
-        result["account"] = iban[16:28]
-
-    # --------------------------------------------------------
-    # ROMANIA
-    # 4 letters bank + account
-    # --------------------------------------------------------
-
-    elif country == "RO":
-
-        result["bank_code"] = iban[4:8]
-        result["account"] = iban[8:24]
-
-    # --------------------------------------------------------
-    # BULGARIA
-    # 4 letters bank + branch structure
-    # --------------------------------------------------------
-
-    elif country == "BG":
-
-        result["bank_code"] = iban[4:8]
-        result["branch_code"] = iban[8:12]
-        result["account"] = iban[12:22]
-
-    # --------------------------------------------------------
-    # CROATIA
-    # 7 bank digits + account
-    # --------------------------------------------------------
-
-    elif country == "HR":
-
-        result["bank_code"] = iban[4:11]
-        result["account"] = iban[11:21]
-
-    # --------------------------------------------------------
-    # SLOVENIA
-    # 5 bank/branch + account
-    # --------------------------------------------------------
-
-    elif country == "SI":
-
-        result["bank_code"] = iban[4:9]
-        result["account"] = iban[9:19]
-
-    # --------------------------------------------------------
-    # SERBIA
-    # --------------------------------------------------------
-
-    elif country == "RS":
-
-        result["bank_code"] = iban[4:7]
-        result["branch_code"] = iban[7:10]
-        result["account"] = iban[10:22]
-
-    # --------------------------------------------------------
-    # MONTENEGRO
-    # --------------------------------------------------------
-
-    elif country == "ME":
-
-        result["bank_code"] = iban[4:7]
-        result["branch_code"] = iban[7:10]
-        result["account"] = iban[10:22]
-
-    # --------------------------------------------------------
-    # NORTH MACEDONIA
-    # --------------------------------------------------------
-
-    elif country == "MK":
-
-        result["bank_code"] = iban[4:7]
-        result["branch_code"] = iban[7:10]
-        result["account"] = iban[10:19]
-
-    # --------------------------------------------------------
-    # BOSNIA
-    # --------------------------------------------------------
-
-    elif country == "BA":
-
-        result["bank_code"] = iban[4:10]
-        result["account"] = iban[10:20]
-
-    # --------------------------------------------------------
-    # ALBANIA
-    # --------------------------------------------------------
-
-    elif country == "AL":
-
-        result["bank_code"] = iban[4:12]
-        result["branch_code"] = iban[12:16]
-        result["account"] = iban[16:28]
-
-    # --------------------------------------------------------
-    # TURKEY
-    # --------------------------------------------------------
-
-    elif country == "TR":
-
-        result["bank_code"] = iban[4:9]
-        result["reserve"] = iban[9:10]
-        result["account"] = iban[10:26]
-
-    # --------------------------------------------------------
-    # GEORGIA
-    # --------------------------------------------------------
-
-    elif country == "GE":
-
-        result["bank_code"] = iban[4:6]
-        result["account"] = iban[6:22]
-
-    # --------------------------------------------------------
-    # MOLDOVA
-    # --------------------------------------------------------
-
-    elif country == "MD":
-
-        result["bank_code"] = iban[4:8]
-        result["account"] = iban[8:24]
-
-    # --------------------------------------------------------
-    # UKRAINE
-    # --------------------------------------------------------
-
-    elif country == "UA":
-
-        result["bank_code"] = iban[4:10]
-        result["account"] = iban[10:29]
-
-    # --------------------------------------------------------
-    # KOSOVO
-    # --------------------------------------------------------
-
-    elif country == "XK":
-
-        result["bank_code"] = iban[4:10]
-        result["account"] = iban[10:20]
-
-    # --------------------------------------------------------
-    # GENERIC
-    # --------------------------------------------------------
-
-    else:
-
-        result["bban"] = iban[4:]
-
-    return result
-
-
-# ============================================================
-# EPC DATABASE
-# ============================================================
-
-class EPCDatabase:
-
-    def __init__(self):
-        self.sct = {}
-        self.instant = {}
-        self.updated = 0
-        self.lock = asyncio.Lock()
-
-    async def download(
-        self,
-        session,
-        url,
-    ):
-
-        try:
-
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(
-                    total=60
-                ),
-                headers={
-                    "User-Agent":
-                        "Free-European-IBAN-Bot/1.0"
-                },
-            ) as response:
-
-                if response.status != 200:
-                    logger.warning(
-                        "EPC HTTP %s",
-                        response.status,
-                    )
-                    return []
-
-                raw = await response.read()
-
-                text = raw.decode(
-                    "utf-8-sig",
-                    errors="replace",
-                )
-
-                try:
-                    dialect = csv.Sniffer().sniff(
-                        text[:10000],
-                        delimiters=";,"
-                    )
-                except Exception:
-                    dialect = csv.excel
-
-                return list(
-                    csv.DictReader(
-                        io.StringIO(text),
-                        dialect=dialect,
-                    )
-                )
-
-        except Exception as exc:
-
-            logger.warning(
-                "EPC download failed: %s",
-                exc,
-            )
-
-            return []
-
-    def index(self, rows):
-
-        result = {}
-
-        for row in rows:
-
-            normalized = {}
-
-            for key, value in row.items():
-
-                k = re.sub(
-                    r"[^A-Z0-9]",
-                    "",
-                    str(key).upper(),
-                )
-
-                normalized[k] = (
-                    str(value).strip()
-                    if value is not None
-                    else ""
-                )
-
-            bic = (
-                normalized.get("BIC")
-                or normalized.get("BIC11")
-                or normalized.get("BIC8")
-            )
-
-            if not bic:
-                continue
-
-            bic = clean(bic)
-
-            result[bic] = normalized
-
-        return result
-
-    async def refresh(
-        self,
-        session,
-    ):
-
-        now = asyncio.get_running_loop().time()
-
-        if (
-            self.updated
-            and now - self.updated < 21600
-        ):
-            return
-
-        async with self.lock:
-
-            now = asyncio.get_running_loop().time()
-
-            if (
-                self.updated
-                and now - self.updated < 21600
-            ):
-                return
-
-            sct_rows, instant_rows = (
-                await asyncio.gather(
-                    self.download(
-                        session,
-                        EPC_SCT_CSV,
+                return {
+                    "online": False,
+                    "error": (
+                        f"HTTP {response.status}"
                     ),
-                    self.download(
-                        session,
-                        EPC_SCT_INST_CSV,
-                    ),
-                )
-            )
+                }
 
-            if sct_rows:
-                self.sct = self.index(
-                    sct_rows
-                )
+            html = await response.text()
 
-            if instant_rows:
-                self.instant = self.index(
-                    instant_rows
-                )
+    except Exception as e:
 
-            self.updated = now
-
-            logger.info(
-                "EPC loaded: SCT=%d / SCT Inst=%d",
-                len(self.sct),
-                len(self.instant),
-            )
-
-    def find_bic(
-        self,
-        bic,
-    ):
-
-        if not bic:
-            return {}
-
-        bic = clean(bic)
-        bic8 = bic[:8]
-
-        sct = (
-            self.sct.get(bic)
-            or self.sct.get(bic8)
-        )
-
-        instant = (
-            self.instant.get(bic)
-            or self.instant.get(bic8)
+        logger.exception(
+            "Website request failed"
         )
 
         return {
-            "sct": bool(sct),
-            "instant": bool(instant),
-            "sct_data": sct or {},
-            "instant_data": instant or {},
+            "online": False,
+            "error": str(e),
         }
 
-
-epc = EPCDatabase()
-
-
-# ============================================================
-# FREE BIC LOOKUP
-# ============================================================
-
-async def lookup_bic(
-    session,
-    semaphore,
-    code,
-    country,
-):
-
-    if not code:
-        return {}
-
-    # IBANTools endpoint
-    urls = [
-        f"https://www.ibantools.org/api/v1/swift/{code}",
-        f"https://www.ibantools.org/api/v1/swift/search?q={code}",
-    ]
-
-    async with semaphore:
-
-        for url in urls:
-
-            try:
-
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(
-                        total=TIMEOUT
-                    ),
-                ) as response:
-
-                    if response.status != 200:
-                        continue
-
-                    data = await response.json()
-
-                    if isinstance(
-                        data,
-                        dict,
-                    ):
-                        return data
-
-                    if isinstance(
-                        data,
-                        list,
-                    ) and data:
-
-                        if isinstance(
-                            data[0],
-                            dict,
-                        ):
-                            return data[0]
-
-            except Exception:
-                continue
-
-    return {}
-
-
-# ============================================================
-# EXTRACT BIC FROM DATA
-# ============================================================
-
-def extract_bic(data):
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-        return None
-
-    for key in (
-        "bic",
-        "BIC",
-        "swift",
-        "SWIFT",
-        "swift_code",
-        "bic_code",
-    ):
-
-        value = data.get(key)
-
-        if value:
-            return str(value).upper()
-
-    return None
-
-
-def extract_bank_name(data):
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-        return None
-
-    for key in (
-        "bank_name",
-        "BankName",
-        "name",
-        "Name",
-        "institution",
-        "institution_name",
-    ):
-
-        value = data.get(key)
-
-        if value:
-            return str(value)
-
-    return None
-
-
-def extract_city(data):
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-        return None
-
-    for key in (
-        "city",
-        "City",
-        "bank_city",
-    ):
-
-        value = data.get(key)
-
-        if value:
-            return str(value)
-
-    return None
-
-
-def extract_address(data):
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-        return None
-
-    for key in (
-        "address",
-        "Address",
-        "bank_address",
-    ):
-
-        value = data.get(key)
-
-        if value:
-            return str(value)
-
-    return None
-
-
-# ============================================================
-# VALIDATE ONE IBAN
-# ============================================================
-
-async def process_iban(
-    session,
-    semaphore,
-    iban,
-):
-
-    country = iban[:2]
-
-    expected_length = IBAN_LENGTHS.get(
-        country
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
     )
 
-    structure = parse_structure(
-        iban
+    # Remove scripts/styles
+    for tag in soup(
+        ["script", "style", "noscript"]
+    ):
+        tag.decompose()
+
+    text = soup.get_text(
+        "\n",
+        strip=True
     )
+
+    # -----------------------------------------------------
+    # Extract useful fields
+    # -----------------------------------------------------
 
     result = {
-        "iban": iban,
-        "country": country,
-        "country_name": country_name(
-            country
-        ),
-        "expected_length": expected_length,
-        "actual_length": len(iban),
-        "structure": structure,
-        "valid_length": (
-            expected_length is None
-            or len(iban)
-            == expected_length
-        ),
-        "mod97": False,
-        "bic": None,
+        "online": True,
+        "valid": None,
         "bank": None,
+        "bic": None,
         "city": None,
         "address": None,
-        "sct": None,
+        "country": None,
+        "sepa": None,
         "instant": None,
+        "raw_text": text,
     }
 
-    # MOD97
-    try:
-        result["mod97"] = mod97_valid(
-            iban
-        )
-    except Exception:
-        result["mod97"] = False
+    lower = text.lower()
 
-    # --------------------------------------------------------
-    # Try to get BIC from possible bank code
-    # --------------------------------------------------------
+    # -----------------------------------------------------
+    # VALID / INVALID
+    # -----------------------------------------------------
 
-    possible_codes = []
+    invalid_words = [
+        "invalid iban",
+        "iban is invalid",
+        "not valid",
+        "incorrect iban",
+        "ungültig",
+        "invalid",
+    ]
 
-    for key in (
-        "abi",
-        "blz",
-        "bank_code",
-        "clearing",
+    valid_words = [
+        "valid iban",
+        "iban is valid",
+        "valid",
+        "gültig",
+    ]
+
+    if any(
+        word in lower
+        for word in invalid_words
+    ):
+        result["valid"] = False
+
+    elif any(
+        word in lower
+        for word in valid_words
+    ):
+        result["valid"] = True
+
+    # -----------------------------------------------------
+    # Search labels in HTML/text
+    # -----------------------------------------------------
+
+    def find_after_labels(
+        labels,
+        max_distance=300,
     ):
 
-        value = structure.get(key)
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
 
-        if value:
-            possible_codes.append(
-                str(value)
-            )
+        for i, line in enumerate(lines):
 
-    # Search using bank code
-    for code in possible_codes:
+            line_lower = line.lower()
 
-        data = await lookup_bic(
-            session,
-            semaphore,
-            code,
-            country,
-        )
+            for label in labels:
 
-        bic = extract_bic(data)
+                if label in line_lower:
 
-        if bic:
+                    # Same line: "Bank: XYZ"
+                    if ":" in line:
 
-            result["bic"] = bic
+                        value = line.split(
+                            ":",
+                            1
+                        )[1].strip()
 
-            result["bank"] = (
-                extract_bank_name(data)
-            )
+                        if value:
+                            return value
 
-            result["city"] = (
-                extract_city(data)
-            )
+                    # Next few lines
+                    for j in range(
+                        i + 1,
+                        min(
+                            i + 4,
+                            len(lines)
+                        )
+                    ):
 
-            result["address"] = (
-                extract_address(data)
-            )
+                        value = lines[j].strip()
 
-            break
+                        if (
+                            value
+                            and len(value)
+                            < max_distance
+                        ):
+                            return value
 
-    # --------------------------------------------------------
-    # EPC lookup
-    # --------------------------------------------------------
+        return None
 
-    epc_data = epc.find_bic(
-        result["bic"]
+    result["bank"] = find_after_labels(
+        [
+            "bank name",
+            "bank",
+            "bankname",
+        ]
     )
 
-    if result["bic"]:
-
-        sct_data = epc_data[
-            "sct_data"
+    result["bic"] = find_after_labels(
+        [
+            "bic",
+            "swift",
+            "bic/swift",
         ]
+    )
 
-        instant_data = epc_data[
-            "instant_data"
+    result["city"] = find_after_labels(
+        [
+            "city",
+            "town",
         ]
+    )
 
-        if sct_data:
+    result["address"] = find_after_labels(
+        [
+            "address",
+            "bank address",
+        ]
+    )
 
-            result["bank"] = (
-                result["bank"]
-                or sct_data.get(
-                    "PARTICIPANTNAME"
-                )
-                or sct_data.get(
-                    "NAME"
-                )
-            )
+    # -----------------------------------------------------
+    # SEPA
+    # -----------------------------------------------------
 
-            result["city"] = (
-                result["city"]
-                or sct_data.get(
-                    "CITY"
-                )
-            )
+    if (
+        "sepa instant" in lower
+        or "instant credit transfer" in lower
+        or "sct inst" in lower
+    ):
 
-            result["address"] = (
-                result["address"]
-                or sct_data.get(
-                    "ADDRESS"
-                )
-            )
+        result["instant"] = True
 
-        elif instant_data:
+    if (
+        "sepa credit transfer" in lower
+        or "sepa transfer" in lower
+        or "sct" in lower
+    ):
 
-            result["bank"] = (
-                result["bank"]
-                or instant_data.get(
-                    "PARTICIPANTNAME"
-                )
-                or instant_data.get(
-                    "NAME"
-                )
-            )
-
-            result["city"] = (
-                result["city"]
-                or instant_data.get(
-                    "CITY"
-                )
-            )
-
-            result["address"] = (
-                result["address"]
-                or instant_data.get(
-                    "ADDRESS"
-                )
-            )
-
-    result["sct"] = epc_data[
-        "sct"
-    ]
-
-    result["instant"] = epc_data[
-        "instant"
-    ]
+        result["sepa"] = True
 
     return result
 
 
-# ============================================================
-# FORMAT
-# ============================================================
+# =========================================================
+# RESULT FORMAT
+# =========================================================
 
-def yes_no_unknown(value):
+def format_result(
+    iban,
+    online_result,
+):
 
-    if value is True:
-        return "✅ نعم"
+    country = iban[:2]
 
-    if value is False:
-        return "❌ لا"
+    try:
+        technical_valid = check_mod97(
+            iban
+        )
+    except Exception:
+        technical_valid = False
 
-    return "⚠️ غير محدد"
-
-
-def format_result(result):
-
-    iban = result["iban"]
-
-    country = result[
-        "country"
-    ]
-
-    length_ok = result[
-        "valid_length"
-    ]
-
-    mod97 = result[
-        "mod97"
-    ]
-
-    technical_valid = (
-        length_ok
-        and mod97
+    # Website result takes priority
+    website_valid = online_result.get(
+        "valid"
     )
 
-    if technical_valid:
+    if website_valid is False:
+        status = "❌ غير صالح"
+
+    elif website_valid is True:
+        status = "✅ صالح"
+
+    elif technical_valid:
         status = (
-            "✅ صالح فنيًا"
+            "✅ صالح من ناحية التحقق الفني"
         )
+
     else:
-        status = (
-            "❌ غير صالح"
-        )
+        status = "❌ غير صالح"
 
-    lines = []
-
-    lines.append(
-        f"🔢 <code>{format_iban(iban)}</code>"
-    )
-
-    lines.append(
-        f"• الحالة: <b>{status}</b>"
-    )
-
-    lines.append(
-        f"• الدولة: "
-        f"{result['country_name']} "
-        f"(<code>{country}</code>)"
-    )
-
-    lines.append(
-        f"• طول IBAN: "
-        f"{result['actual_length']}"
-        + (
-            f"/{result['expected_length']}"
-            if result[
-                "expected_length"
-            ]
-            else ""
-        )
-    )
-
-    lines.append(
-        f"• MOD-97: "
-        f"{'✅ صحيح' if mod97 else '❌ خطأ'}"
-    )
-
-    structure = result[
-        "structure"
-    ]
-
-    if structure:
-
-        lines.append("")
-        lines.append(
-            "🏦 <b>بيانات الحساب المحلية</b>"
-        )
-
-        labels = {
-            "abi": "ABI",
-            "cab": "CAB",
-            "cin": "CIN",
-            "blz": "BLZ",
-            "bank_code": "Bank Code",
-            "branch_code": "Branch Code",
-            "sort_code": "Sort Code",
-            "clearing": "Clearing",
-            "bank_prefix": "Bank Prefix",
-            "account_check": "Account Check",
-            "rib_key": "RIB Key",
-        }
-
-        for key, label in labels.items():
-
-            value = structure.get(
-                key
-            )
-
-            if value:
-                lines.append(
-                    f"• {label}: "
-                    f"<code>{value}</code>"
-                )
-
-    lines.append("")
-    lines.append(
-        "🏢 <b>معلومات البنك</b>"
-    )
-
-    lines.append(
-        "• البنك: "
-        + (
-            result["bank"]
+    def value(key):
+        return (
+            online_result.get(key)
             or "غير متوفر"
         )
+
+    sepa = online_result.get(
+        "sepa"
     )
 
-    lines.append(
-        "• BIC/SWIFT: "
-        + (
-            f"<code>{result['bic']}</code>"
-            if result["bic"]
-            else "غير متوفر"
-        )
+    instant = online_result.get(
+        "instant"
     )
 
-    lines.append(
-        "• المدينة: "
-        + (
-            result["city"]
-            or "غير متوفر"
-        )
+    if sepa is True:
+        sepa_text = "✅ مدعوم"
+    elif sepa is False:
+        sepa_text = "❌ غير مدعوم"
+    else:
+        sepa_text = "⚠️ غير محدد"
+
+    if instant is True:
+        instant_text = "✅ مدعوم"
+    elif instant is False:
+        instant_text = "❌ غير مدعوم"
+    else:
+        instant_text = "⚠️ غير محدد"
+
+    return (
+        "📋 <b>نتائج فحص IBAN</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"🔢 <code>{iban}</code>\n\n"
+
+        f"• الحالة: <b>{status}</b>\n"
+        f"• الدولة: <code>{country}</code>\n\n"
+
+        "🏦 <b>بيانات البنك</b>\n"
+        f"• البنك: {value('bank')}\n"
+        f"• BIC/SWIFT: "
+        f"<code>{value('bic')}</code>\n"
+        f"• المدينة: {value('city')}\n"
+        f"• العنوان: {value('address')}\n\n"
+
+        "💶 <b>SEPA</b>\n"
+        f"• SEPA Normal (SCT): "
+        f"{sepa_text}\n"
+        f"• SEPA Instant (SCT Inst): "
+        f"{instant_text}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "ℹ️ المصدر: IBAN Calculator\n"
+        "ℹ️ التحقق لا يثبت أن الحساب مفتوح "
+        "أو يحتوي على رصيد."
     )
 
-    lines.append(
-        "• العنوان: "
-        + (
-            result["address"]
-            or "غير متوفر"
-        )
-    )
 
-    lines.append("")
-    lines.append(
-        "💶 <b>SEPA</b>"
-    )
-
-    lines.append(
-        "• SEPA Normal (SCT): "
-        + yes_no_unknown(
-            result["sct"]
-        )
-    )
-
-    lines.append(
-        "• SEPA Instant (SCT Inst): "
-        + yes_no_unknown(
-            result["instant"]
-        )
-    )
-
-    return "\n".join(
-        lines
-    )
-
-
-# ============================================================
-# TELEGRAM HANDLER
-# ============================================================
+# =========================================================
+# TELEGRAM
+# =========================================================
 
 async def handle_message(
     update: Update,
@@ -1390,187 +442,112 @@ async def handle_message(
         return
 
     text = (
-        update.message.text
-        or ""
+        update.message.text or ""
     ).strip()
 
-    ibans = extract_ibans(
-        text
-    )
+    ibans = extract_ibans(text)
 
     if not ibans:
 
         await update.message.reply_text(
-            "❌ لم أجد أي IBAN.\n\n"
-            "أرسل IBAN واحد أو قائمة IBANs."
+            "❌ أرسل IBAN صالحًا."
         )
 
         return
 
-    if len(ibans) > MAX_IBANS:
+    if len(ibans) > 10:
 
         await update.message.reply_text(
-            f"❌ الحد الأقصى "
-            f"{MAX_IBANS} IBAN."
+            "❌ الحد الأقصى 10 IBAN في الرسالة."
         )
 
         return
 
     wait = (
         await update.message.reply_text(
-            f"⏳ جاري فحص "
-            f"{len(ibans)} IBAN..."
+            f"⏳ جاري فحص {len(ibans)} IBAN..."
         )
     )
 
-    connector = aiohttp.TCPConnector(
-        limit=CONCURRENCY
-    )
+    async with aiohttp.ClientSession() as session:
 
-    semaphore = asyncio.Semaphore(
-        CONCURRENCY
-    )
+        results = []
 
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers={
-            "User-Agent":
-                "European-IBAN-Bot/1.0"
-        },
-    ) as session:
+        for iban in ibans:
 
-        # تحديث EPC
-        await epc.refresh(
-            session
-        )
-
-        tasks = [
-            process_iban(
+            result = await check_iban_online(
                 session,
-                semaphore,
-                iban,
+                iban
             )
-            for iban in ibans
-        ]
 
-        results = await asyncio.gather(
-            *tasks
-        )
-
-    header = (
-        "📋 <b>نتائج فحص IBAN</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-
-    blocks = []
-
-    for result in results:
-
-        blocks.append(
-            format_result(
-                result
+            results.append(
+                format_result(
+                    iban,
+                    result
+                )
             )
-        )
 
-    body = (
-        "\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-    ).join(
-        blocks
-    )
-
-    footer = (
-        "\n\n━━━━━━━━━━━━━━━━━━━━\n"
-        "🆓 بدون API مدفوع\n"
-        "ℹ️ التحقق فني فقط؛ لا يثبت أن "
-        "الحساب مفتوح أو فيه رصيد.\n"
-        "ℹ️ SEPA مأخوذ من سجلات EPC الرسمية."
-    )
+            # لا نضغط على الموقع بسرعة
+            await asyncio.sleep(1)
 
     final = (
-        header
-        + body
-        + footer
-    )
+        "\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+    ).join(results)
 
-    # Telegram max message safety
-    if len(final) <= 4000:
+    if len(final) > 4000:
+
+        final = final[:3950] + (
+            "\n\n⚠️ تم اختصار النتيجة."
+        )
+
+    try:
 
         await wait.edit_text(
             final,
-            parse_mode=ParseMode.HTML,
+            parse_mode="HTML"
         )
 
-    else:
-
-        await wait.delete()
-
-        current = header
-
-        for block in blocks:
-
-            piece = (
-                block
-                + "\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-            )
-
-            if (
-                len(current)
-                + len(piece)
-                > 3800
-            ):
-
-                await update.message.reply_text(
-                    current,
-                    parse_mode=ParseMode.HTML,
-                )
-
-                current = piece
-
-            else:
-
-                current += piece
-
-        current += footer
+    except Exception:
 
         await update.message.reply_text(
-            current[:4090],
-            parse_mode=ParseMode.HTML,
+            final,
+            parse_mode="HTML"
         )
 
 
-# ============================================================
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
 def main():
 
     if not TOKEN:
 
         raise RuntimeError(
-            "❌ TELEGRAM_BOT_TOKEN غير موجود."
+            "TELEGRAM_BOT_TOKEN غير موجود في Environment Variables."
         )
 
-    application = (
+    app = (
         ApplicationBuilder()
         .token(TOKEN)
         .build()
     )
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            handle_message,
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
         )
     )
 
-    logger.info(
-        "European IBAN Bot started."
+    print(
+        "IBAN Telegram Bot started..."
     )
 
-    application.run_polling()
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
