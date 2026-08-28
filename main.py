@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import logging
+from html import escape
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -15,7 +16,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# SETTINGS
+# CONFIG
 # =========================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -31,7 +32,7 @@ logger = logging.getLogger("iban-bot")
 
 
 # =========================================================
-# IBAN
+# IBAN FUNCTIONS
 # =========================================================
 
 def clean_iban(value: str) -> str:
@@ -39,401 +40,657 @@ def clean_iban(value: str) -> str:
 
 
 def extract_ibans(text: str):
-    results = []
+    found = []
 
-    # يسمح بـ IBAN فيه مسافات
-    matches = re.findall(
-        r"\b[A-Z]{2}\s*[0-9]{2}(?:[\sA-Z0-9]{10,40})\b",
-        text.upper(),
-    )
+    # البحث عن IBAN مع أو بدون مسافات
+    pattern = r"\b[A-Z]{2}\s*[0-9]{2}(?:[\sA-Z0-9]{10,40})\b"
 
-    for item in matches:
-        iban = clean_iban(item)
+    for match in re.findall(pattern, text.upper()):
+        iban = clean_iban(match)
 
         if (
-            len(iban) >= 15
-            and re.match(r"^[A-Z]{2}[0-9]{2}", iban)
-            and iban not in results
+            15 <= len(iban) <= 34
+            and re.fullmatch(r"[A-Z]{2}[0-9]{2}[A-Z0-9]+", iban)
+            and iban not in found
         ):
-            results.append(iban)
+            found.append(iban)
 
     # fallback
     for word in text.split():
         iban = clean_iban(word)
 
         if (
-            len(iban) >= 15
-            and re.match(r"^[A-Z]{2}[0-9]{2}", iban)
-            and iban not in results
+            15 <= len(iban) <= 34
+            and re.fullmatch(r"[A-Z]{2}[0-9]{2}[A-Z0-9]+", iban)
+            and iban not in found
         ):
-            results.append(iban)
+            found.append(iban)
 
-    return results
+    return found
 
 
 # =========================================================
-# TEXT HELPERS
+# LOCAL IBAN MOD-97
 # =========================================================
 
-def normalize_spaces(text):
-    return re.sub(r"[ \t]+", " ", text).strip()
+def iban_checksum_valid(iban: str) -> bool:
+    try:
+        rearranged = iban[4:] + iban[:4]
 
+        numeric = ""
 
-def clean_lines(text):
-    lines = []
-
-    for line in text.splitlines():
-        line = normalize_spaces(line)
-
-        if line:
-            lines.append(line)
-
-    return lines
-
-
-def find_line_value(lines, labels):
-    """
-    يبحث عن:
-    Bank: ABC
-    أو
-    Bank
-    ABC
-    """
-
-    labels_lower = [
-        x.lower()
-        for x in labels
-    ]
-
-    for i, line in enumerate(lines):
-
-        low = line.lower().strip()
-
-        # نفس السطر
-        for label in labels_lower:
-
-            if low.startswith(label):
-
-                rest = line[
-                    len(label):
-                ].strip(" :|-")
-
-                if rest:
-                    return rest
-
-        # السطر التالي
-        if low in labels_lower:
-
-            if i + 1 < len(lines):
-                return lines[i + 1].strip()
-
-    return None
-
-
-def find_boolean(lines, phrases):
-    text = "\n".join(lines).lower()
-
-    for phrase in phrases:
-
-        if phrase.lower() in text:
-
-            # نحدد هل supported أم not supported
-            index = text.find(
-                phrase.lower()
-            )
-
-            nearby = text[
-                max(0, index - 100):
-                index + 200
-            ]
-
-            if "not supported" in nearby:
+        for char in rearranged:
+            if char.isdigit():
+                numeric += char
+            elif char.isalpha():
+                numeric += str(ord(char) - 55)
+            else:
                 return False
 
-            if "nicht unterstützt" in nearby:
-                return False
+        remainder = 0
 
-            if "supported" in nearby:
-                return True
+        for i in range(0, len(numeric), 7):
+            remainder = int(
+                str(remainder) + numeric[i:i + 7]
+            ) % 97
 
-            if "unterstützt" in nearby:
-                return True
+        return remainder == 1
 
-    return None
+    except Exception:
+        return False
 
 
 # =========================================================
-# PARSE IBAN CALCULATOR
+# HTML HELPERS
 # =========================================================
 
-def parse_page(html, iban):
+def get_clean_soup(html: str):
+    soup = BeautifulSoup(html, "html.parser")
 
-    soup = BeautifulSoup(
-        html,
-        "html.parser",
-    )
-
-    # نحذف السكربتات
-    for tag in soup(
-        ["script", "style", "noscript"]
+    for tag in soup.find_all(
+        ["script", "style", "noscript", "svg"]
     ):
         tag.decompose()
 
-    text = soup.get_text(
-        "\n",
-        strip=True,
+    return soup
+
+
+def clean_value(value):
+    if not value:
+        return None
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
+
+    value = value.strip(
+        " \t\r\n:|-"
     )
 
-    lines = clean_lines(text)
+    if not value:
+        return None
 
-    result = {
-        "iban": iban,
-        "valid": None,
-        "bic": None,
-        "bank": None,
-        "address": None,
-        "branch": None,
-        "sepa": None,
-        "direct_debit": None,
-        "b2b": None,
-        "instant": None,
-        "data_date": None,
+    return value
+
+
+def is_bad_value(value):
+    if not value:
+        return True
+
+    value_lower = value.lower().strip()
+
+    bad_values = {
+        "",
+        "-",
+        "---",
+        "not found",
+        "not available",
+        "nicht verfügbar",
+        "nicht gefunden",
+        "non disponible",
+        "non trovato",
+        "غير متوفر",
+        "unknown",
     }
 
-    lower = text.lower()
+    if value_lower in bad_values:
+        return True
 
-    # =====================================================
-    # VALID
-    # =====================================================
+    # مهم جدًا:
+    # لا نسمح لنصوص Bankleitzahl / bank code
+    # أن تصبح اسم البنك.
+    bad_fragments = [
+        "bankleitzahl",
+        "bank code",
+        "branch code",
+        "sort code",
+        "clearing code",
+        "bank identifier",
+    ]
 
-    if (
-        "this is a valid iban" in lower
-        or "this iban is valid" in lower
-        or "dies ist eine gültige iban" in lower
-        or "dies ist eine gültige iban." in lower
+    if any(
+        fragment in value_lower
+        for fragment in bad_fragments
     ):
-        result["valid"] = True
+        return True
 
-    elif (
-        "this iban is incorrect" in lower
-        or "this is an invalid iban" in lower
-        or "this iban is invalid" in lower
-        or "dies ist keine gültige iban" in lower
-    ):
-        result["valid"] = False
+    return False
 
-    # =====================================================
-    # BIC
-    # =====================================================
 
-    for i, line in enumerate(lines):
+def get_label_value_from_text(
+    soup,
+    labels,
+):
+    """
+    يبحث عن label واضح داخل عناصر HTML،
+    وليس مجرد أول كلمة Bank في الصفحة.
+    """
 
-        if line.lower().startswith("bic:"):
+    labels_lower = {
+        label.lower().strip()
+        for label in labels
+    }
 
-            value = line.split(
-                ":",
-                1
-            )[1].strip()
+    # -----------------------------------------------------
+    # الطريقة 1: عناصر table
+    # -----------------------------------------------------
 
-            # أحيانًا يكون بعد BIC اسم المدينة بين قوسين
-            value = re.sub(
-                r"\s*\([^)]*\)\s*$",
-                "",
-                value,
+    for row in soup.find_all("tr"):
+
+        cells = row.find_all(
+            ["th", "td"]
+        )
+
+        if len(cells) < 2:
+            continue
+
+        first = clean_value(
+            cells[0].get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not first:
+            continue
+
+        first_lower = first.lower().rstrip(":")
+
+        if first_lower in labels_lower:
+
+            value = clean_value(
+                cells[1].get_text(
+                    " ",
+                    strip=True
+                )
             )
 
-            result["bic"] = value
-            break
+            if not is_bad_value(value):
+                return value
 
-    # fallback
-    if not result["bic"]:
+    # -----------------------------------------------------
+    # الطريقة 2: عناصر label
+    # -----------------------------------------------------
 
-        for line in lines:
+    for label in soup.find_all(
+        ["label", "dt", "strong", "b"]
+    ):
 
-            match = re.search(
-                r"\bBIC:\s*([A-Z0-9]{8,11})",
-                line,
-                re.I,
+        label_text = clean_value(
+            label.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not label_text:
+            continue
+
+        label_lower = (
+            label_text
+            .lower()
+            .rstrip(":")
+        )
+
+        if label_lower not in labels_lower:
+            continue
+
+        # العنصر التالي
+        next_element = label.find_next()
+
+        if next_element:
+
+            value = clean_value(
+                next_element.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+            if (
+                value
+                and value.lower()
+                != label_text.lower()
+                and not is_bad_value(value)
+            ):
+                return value
+
+    # -----------------------------------------------------
+    # الطريقة 3: عناصر تحتوي label:value
+    # لكن فقط إذا كان الـlabel مطابقًا بالكامل
+    # -----------------------------------------------------
+
+    for element in soup.find_all(
+        ["p", "div", "li", "span"]
+    ):
+
+        text = clean_value(
+            element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not text:
+            continue
+
+        for label in labels:
+
+            pattern = (
+                r"^"
+                + re.escape(label)
+                + r"\s*:\s*(.+)$"
+            )
+
+            match = re.match(
+                pattern,
+                text,
+                re.IGNORECASE
             )
 
             if match:
-                result["bic"] = (
-                    match.group(1).upper()
+
+                value = clean_value(
+                    match.group(1)
                 )
-                break
 
-    # =====================================================
-    # BANK
-    # =====================================================
+                if not is_bad_value(value):
+                    return value
 
-    result["bank"] = find_line_value(
-        lines,
+    return None
+
+
+# =========================================================
+# EXTRACT BIC SAFELY
+# =========================================================
+
+def extract_bic(soup):
+    value = get_label_value_from_text(
+        soup,
         [
-            "Bank:",
+            "BIC",
+            "BIC/SWIFT",
+            "SWIFT",
+        ],
+    )
+
+    if not value:
+        return None
+
+    # BIC الحقيقي يكون 8 أو 11 حرف/رقم
+    match = re.search(
+        r"\b[A-Z0-9]{8}(?:[A-Z0-9]{3})?\b",
+        value.upper()
+    )
+
+    if not match:
+        return None
+
+    bic = match.group(0)
+
+    # BIC لا يكون مجرد أرقام
+    if not re.search("[A-Z]", bic):
+        return None
+
+    return bic
+
+
+# =========================================================
+# EXTRACT BANK
+# =========================================================
+
+def extract_bank(soup):
+    value = get_label_value_from_text(
+        soup,
+        [
             "Bank",
-            "Banca:",
-            "Banque:",
-            "Banco:",
+            "Bank name",
+            "Bank Name",
+            "Bankname",
+            "Banca",
+            "Banco",
+            "Banque",
         ],
     )
 
-    # إزالة أشياء غير مرغوبة
-    if result["bank"]:
-        result["bank"] = result[
-            "bank"
-        ].strip()
+    if is_bad_value(value):
+        return None
 
-    # =====================================================
-    # BRANCH
-    # =====================================================
+    # حماية إضافية ضد Bankleitzahl
+    if value:
 
-    result["branch"] = find_line_value(
-        lines,
-        [
-            "Branch number:",
-            "Branch number",
-            "Branch:",
-            "Branch",
-            "Filiale:",
-            "Oficina:",
-        ],
-    )
+        lower = value.lower()
 
-    # =====================================================
-    # ADDRESS
-    # =====================================================
+        forbidden = [
+            "bankleitzahl",
+            "bank code",
+            "branch code",
+            "sort code",
+            "clearing code",
+        ]
 
-    # الموقع عادة يضع العنوان مباشرة بعد اسم البنك
-    # وقبل SEPA.
-
-    bank_index = None
-
-    for i, line in enumerate(lines):
-
-        if (
-            result["bank"]
-            and line.strip()
-            == result["bank"].strip()
+        if any(
+            x in lower
+            for x in forbidden
         ):
-            bank_index = i
-            break
+            return None
 
-    if bank_index is not None:
+    return value
 
-        address_lines = []
 
-        for line in lines[
-            bank_index + 1:
+# =========================================================
+# EXTRACT BRANCH
+# =========================================================
+
+def extract_branch(soup):
+    value = get_label_value_from_text(
+        soup,
+        [
+            "Branch number",
+            "Branch Number",
+            "Branch",
+            "Branch code",
+        ],
+    )
+
+    if is_bad_value(value):
+        return None
+
+    return value
+
+
+# =========================================================
+# EXTRACT ADDRESS
+# =========================================================
+
+def extract_address(soup):
+    value = get_label_value_from_text(
+        soup,
+        [
+            "Address",
+            "Bank address",
+            "Bank Address",
+        ],
+    )
+
+    if not is_bad_value(value):
+        return value
+
+    # -----------------------------------------------------
+    # إذا لم يوجد label واضح:
+    # نبحث عن كتلة العنوان بعد اسم البنك/BIC
+    # -----------------------------------------------------
+
+    bank = extract_bank(soup)
+
+    if not bank:
+        return None
+
+    all_elements = soup.find_all(
+        ["p", "div", "td", "li"]
+    )
+
+    for i, element in enumerate(
+        all_elements
+    ):
+
+        current = clean_value(
+            element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if current != bank:
+            continue
+
+        possible = []
+
+        for next_element in all_elements[
+            i + 1:i + 5
         ]:
 
-            low = line.lower()
+            text = clean_value(
+                next_element.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+            if not text:
+                continue
+
+            low = text.lower()
 
             if (
                 "sepa credit transfer"
                 in low
                 or "sepa direct debit"
                 in low
-                or "b2b is supported"
-                in low
                 or "sepa instant"
                 in low
-                or "this iban can be found"
+                or "b2b"
                 in low
-                or "data valid as of"
+                or "branch number"
                 in low
-                or "branch number" in low
-                or "filiale:" in low
-                or "oficina:" in low
             ):
                 break
 
-            # نتجنب العناوين العامة
-            if (
-                line.startswith("BIC:")
-                or line.startswith("IBAN:")
-            ):
+            if text == bank:
                 continue
 
-            address_lines.append(line)
+            possible.append(text)
 
-            if len(address_lines) >= 4:
-                break
-
-        if address_lines:
-            result["address"] = "\n".join(
-                address_lines
+        if possible:
+            return "\n".join(
+                possible[:3]
             )
 
+    return None
+
+
+# =========================================================
+# SUPPORT DETECTION
+# =========================================================
+
+def detect_support(
+    soup,
+    exact_phrases,
+):
+    """
+    لا نعتبر وجود كلمة SEPA وحدها دعمًا.
+    نبحث عن جملة واضحة مثل:
+    SEPA Credit Transfer is supported.
+    """
+
+    full_text = soup.get_text(
+        " ",
+        strip=True
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        full_text
+    ).lower()
+
+    for phrase in exact_phrases:
+
+        p = re.escape(
+            phrase.lower()
+        )
+
+        # supported
+        if re.search(
+            p
+            + r"\s+(?:is\s+)?supported\b",
+            normalized,
+            re.IGNORECASE,
+        ):
+            return True
+
+        # not supported
+        if re.search(
+            p
+            + r"\s+(?:is\s+)?not\s+supported\b",
+            normalized,
+            re.IGNORECASE,
+        ):
+            return False
+
+        # German
+        if re.search(
+            p
+            + r".{0,30}"
+            r"(nicht unterstützt|nicht unterstuetzt)",
+            normalized,
+            re.IGNORECASE,
+        ):
+            return False
+
+        if re.search(
+            p
+            + r".{0,30}"
+            r"(unterstützt|unterstuetzt)",
+            normalized,
+            re.IGNORECASE,
+        ):
+            return True
+
+    return None
+
+
+# =========================================================
+# PARSE PAGE
+# =========================================================
+
+def parse_result(html, iban):
+
+    soup = get_clean_soup(html)
+
+    visible_text = soup.get_text(
+        "\n",
+        strip=True
+    )
+
+    lower_text = visible_text.lower()
+
+    result = {
+        "iban": iban,
+        "valid": None,
+        "country": iban[:2],
+        "bank": None,
+        "bic": None,
+        "address": None,
+        "branch": None,
+        "sepa": None,
+        "direct_debit": None,
+        "b2b": None,
+        "instant": None,
+    }
+
     # =====================================================
-    # SEPA CREDIT TRANSFER
+    # VALID
     # =====================================================
 
-    result["sepa"] = find_boolean(
-        lines,
-        [
-            "SEPA Credit Transfer",
-            "SEPA Credit Transfer is",
-        ],
+    if (
+        "this is a valid iban" in lower_text
+        or "this iban is valid" in lower_text
+        or "is a valid iban" in lower_text
+        or "dies ist eine gültige iban" in lower_text
+    ):
+        result["valid"] = True
+
+    elif (
+        "this is not a valid iban" in lower_text
+        or "this iban is invalid" in lower_text
+        or "this is an invalid iban" in lower_text
+        or "dies ist keine gültige iban" in lower_text
+    ):
+        result["valid"] = False
+
+    # =====================================================
+    # BANK INFORMATION
+    # =====================================================
+
+    result["bank"] = extract_bank(
+        soup
+    )
+
+    result["bic"] = extract_bic(
+        soup
+    )
+
+    result["branch"] = extract_branch(
+        soup
+    )
+
+    result["address"] = extract_address(
+        soup
     )
 
     # =====================================================
-    # SEPA DIRECT DEBIT
+    # SEPA
     # =====================================================
 
-    result["direct_debit"] = find_boolean(
-        lines,
+    result["sepa"] = detect_support(
+        soup,
+        [
+            "SEPA Credit Transfer",
+        ],
+    )
+
+    result["direct_debit"] = detect_support(
+        soup,
         [
             "SEPA Direct Debit",
         ],
     )
 
-    # =====================================================
-    # B2B
-    # =====================================================
-
-    result["b2b"] = find_boolean(
-        lines,
+    result["b2b"] = detect_support(
+        soup,
         [
             "B2B",
         ],
     )
 
-    # =====================================================
-    # SEPA INSTANT
-    # =====================================================
-
-    result["instant"] = find_boolean(
-        lines,
+    result["instant"] = detect_support(
+        soup,
         [
             "SEPA Instant Credit Transfer",
         ],
     )
 
-    # =====================================================
-    # DATA DATE
-    # =====================================================
-
-    for line in lines:
-
-        if "Data valid as of:" in line:
-
-            result["data_date"] = (
-                line.split(
-                    ":",
-                    1
-                )[1].strip()
-            )
-
-            break
-
     return result
 
 
 # =========================================================
-# ONLINE CHECK
+# ONLINE REQUEST
 # =========================================================
 
-async def check_iban(
+async def check_online(
     session,
     iban,
 ):
@@ -450,6 +707,10 @@ async def check_iban(
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
             "Chrome/139.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
@@ -468,41 +729,47 @@ async def check_iban(
             if response.status != 200:
 
                 return {
+                    "iban": iban,
                     "error": (
-                        f"الموقع رجع HTTP "
-                        f"{response.status}"
-                    )
+                        f"HTTP {response.status}"
+                    ),
                 }
 
             html = await response.text()
 
-            return parse_page(
+            return parse_result(
                 html,
-                iban,
+                iban
             )
 
     except asyncio.TimeoutError:
 
         return {
-            "error": "انتهت مهلة الاتصال بالموقع."
+            "iban": iban,
+            "error": (
+                "انتهت مهلة الاتصال بالموقع."
+            ),
         }
 
     except Exception as e:
 
         logger.exception(
-            "IBAN check error"
+            "Website request failed"
         )
 
         return {
-            "error": str(e)
+            "iban": iban,
+            "error": (
+                "حدث خطأ أثناء الاتصال بالموقع."
+            ),
         }
 
 
 # =========================================================
-# FORMAT
+# FORMAT RESULT
 # =========================================================
 
-def supported(value):
+def support_text(value):
 
     if value is True:
         return "✅ مدعوم"
@@ -510,37 +777,56 @@ def supported(value):
     if value is False:
         return "❌ غير مدعوم"
 
-    return "⚠️ غير محدد من المصدر"
+    return "⚠️ غير محدد"
 
 
 def format_result(data):
 
+    iban = escape(
+        data.get("iban", "")
+    )
+
     if data.get("error"):
 
         return (
-            "⚠️ <b>تعذر الفحص</b>\n\n"
-            f"<code>{data.get('iban', '')}</code>\n"
-            f"• السبب: {data['error']}"
+            "📋 <b>نتائج فحص IBAN</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔢 <code>{iban}</code>\n\n"
+            "⚠️ تعذر الحصول على النتيجة من الموقع.\n"
+            f"• السبب: {escape(data['error'])}"
         )
 
-    status = data.get(
-        "valid"
-    )
+    # -----------------------------------------------------
+    # STATUS
+    # -----------------------------------------------------
 
-    if status is True:
-        status_text = "✅ صالح"
-    elif status is False:
-        status_text = "❌ غير صالح"
+    if data.get("valid") is True:
+
+        status = "✅ صالح"
+
+    elif data.get("valid") is False:
+
+        status = "❌ غير صالح"
+
     else:
-        status_text = "⚠️ لم يتم تحديد الحالة"
 
-    address = (
-        data.get("address")
-        or "غير متوفر"
-    )
+        # نستخدم الفحص الرياضي فقط إذا الموقع
+        # لم يعط حالة واضحة.
+        if iban_checksum_valid(
+            data["iban"]
+        ):
+            status = (
+                "⚠️ صالح فنيًا، "
+                "لكن المصدر لم يعط حالة واضحة"
+            )
+        else:
+            status = (
+                "❌ غير صالح فنيًا"
+            )
 
-    # حماية HTML
-    from html import escape
+    # -----------------------------------------------------
+    # VALUES
+    # -----------------------------------------------------
 
     bank = escape(
         data.get("bank")
@@ -552,6 +838,16 @@ def format_result(data):
         or "غير متوفر"
     )
 
+    branch = escape(
+        data.get("branch")
+        or "غير متوفر"
+    )
+
+    address = (
+        data.get("address")
+        or "غير متوفر"
+    )
+
     address = escape(
         address
     ).replace(
@@ -559,18 +855,8 @@ def format_result(data):
         "<br>"
     )
 
-    branch = escape(
-        data.get("branch")
-        or "غير متوفر"
-    )
-
-    iban = escape(
-        data.get("iban")
-        or ""
-    )
-
-    date = (
-        data.get("data_date")
+    country = escape(
+        data.get("country")
         or "غير متوفر"
     )
 
@@ -580,35 +866,36 @@ def format_result(data):
 
         f"🔢 <code>{iban}</code>\n\n"
 
-        f"• الحالة: <b>{status_text}</b>\n\n"
+        f"• الحالة: <b>{status}</b>\n"
+        f"• الدولة: <b>{country}</b>\n\n"
 
         "🏦 <b>بيانات البنك</b>\n"
         f"• البنك: {bank}\n"
         f"• BIC/SWIFT: "
         f"<code>{bic}</code>\n"
         f"• العنوان: {address}\n"
-        f"• Branch: <code>{branch}</code>\n\n"
+        f"• Branch: "
+        f"<code>{branch}</code>\n\n"
 
         "💶 <b>SEPA</b>\n"
         f"• SEPA Credit Transfer: "
-        f"{supported(data.get('sepa'))}\n"
+        f"{support_text(data.get('sepa'))}\n"
         f"• SEPA Direct Debit: "
-        f"{supported(data.get('direct_debit'))}\n"
+        f"{support_text(data.get('direct_debit'))}\n"
         f"• B2B: "
-        f"{supported(data.get('b2b'))}\n"
+        f"{support_text(data.get('b2b'))}\n"
         f"• SEPA Instant Credit Transfer: "
-        f"{supported(data.get('instant'))}\n\n"
+        f"{support_text(data.get('instant'))}\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"ℹ️ بيانات المصدر: {escape(date)}\n"
         "ℹ️ المصدر: IBAN Calculator\n"
-        "⚠️ صلاحية IBAN لا تثبت أن الحساب "
+        "⚠️ صلاحية IBAN لا تعني أن الحساب "
         "مفتوح أو يحتوي على رصيد."
     )
 
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM HANDLER
 # =========================================================
 
 async def handle_message(
@@ -631,8 +918,8 @@ async def handle_message(
     if not ibans:
 
         await update.message.reply_text(
-            "❌ لم أجد IBAN.\n\n"
-            "أرسل IBAN واحد أو عدة IBANs."
+            "❌ لم أجد IBAN صالحًا.\n\n"
+            "أرسل رقم IBAN واحد أو قائمة IBANs."
         )
 
         return
@@ -656,33 +943,46 @@ async def handle_message(
 
         for iban in ibans:
 
-            result = await check_iban(
+            result = await check_online(
                 session,
-                iban,
+                iban
             )
 
             results.append(
-                format_result(result)
+                format_result(
+                    result
+                )
             )
 
-            # حتى لا نرسل طلبات كثيرة بسرعة
+            # تقليل الضغط على الموقع
             await asyncio.sleep(1)
 
-    final = (
+    final_text = (
         "\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
     ).join(results)
 
-    # Telegram message limit
-    if len(final) > 4000:
-        final = final[:3900] + (
-            "\n\n⚠️ تم اختصار النتيجة."
+    # Telegram limit
+    if len(final_text) > 4000:
+
+        final_text = (
+            final_text[:3900]
+            + "\n\n⚠️ تم اختصار النتائج."
         )
 
-    await wait.edit_text(
-        final,
-        parse_mode="HTML",
-    )
+    try:
+
+        await wait.edit_text(
+            final_text,
+            parse_mode="HTML",
+        )
+
+    except Exception:
+
+        await update.message.reply_text(
+            final_text,
+            parse_mode="HTML",
+        )
 
 
 # =========================================================
@@ -694,17 +994,18 @@ def main():
     if not TOKEN:
 
         raise RuntimeError(
-            "❌ TELEGRAM_BOT_TOKEN غير موجود "
-            "في Render Environment Variables."
+            "❌ لم يتم العثور على "
+            "TELEGRAM_BOT_TOKEN "
+            "في Environment Variables."
         )
 
-    app = (
+    application = (
         ApplicationBuilder()
         .token(TOKEN)
         .build()
     )
 
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.TEXT
             & ~filters.COMMAND,
@@ -713,10 +1014,10 @@ def main():
     )
 
     logger.info(
-        "IBAN Bot started successfully."
+        "IBAN Bot started."
     )
 
-    app.run_polling(
+    application.run_polling(
         drop_pending_updates=True
     )
 
