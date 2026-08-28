@@ -572,6 +572,8 @@ def detect_support(
             phrase.lower()
         )
 
+        # English: supported
+
         if re.search(
             p
             + r"\s+(?:is\s+)?supported\b",
@@ -579,6 +581,8 @@ def detect_support(
             re.IGNORECASE
         ):
             return True
+
+        # English: not supported
 
         if re.search(
             p
@@ -588,6 +592,8 @@ def detect_support(
         ):
             return False
 
+        # German: not supported
+
         if re.search(
             p
             + r".{0,40}"
@@ -596,6 +602,8 @@ def detect_support(
             re.IGNORECASE
         ):
             return False
+
+        # German: supported
 
         if re.search(
             p
@@ -793,12 +801,12 @@ async def check_iban(
 def support_text(value):
 
     if value is True:
-        return "Supported"
+        return "✅ Supported"
 
     if value is False:
-        return "Not supported"
+        return "❌ Not supported"
 
-    return "Unknown"
+    return "❓ Unknown"
 
 
 def format_result(data):
@@ -1189,4 +1197,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         run_server()
-        ) 
+    ) 
