@@ -4,7 +4,6 @@ import csv
 import io
 import asyncio
 import logging
-from typing import Optional
 
 import aiohttp
 from telegram import Update
@@ -20,20 +19,25 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-IBANTOOLS_VALIDATE_URL = (
+IBANTOOLS_VALIDATE = (
     "https://www.ibantools.org/api/v1/iban/validate/{}"
 )
 
-IBANTOOLS_SWIFT_SEARCH_URL = (
+IBANTOOLS_SWIFT = (
+    "https://www.ibantools.org/api/v1/swift/{}"
+)
+
+IBANTOOLS_SWIFT_SEARCH = (
     "https://www.ibantools.org/api/v1/swift/search"
 )
 
 # Official EPC registers
 EPC_SCT_CSV = (
     "https://www.europeanpaymentscouncil.eu/"
-    "sites/default/files/participants_export/sct/sct.csv"
+    "sites/default/files/participants_export/"
+    "sct/sct.csv"
 )
 
 EPC_SCT_INST_CSV = (
@@ -42,235 +46,141 @@ EPC_SCT_INST_CSV = (
     "sct_inst/sct_inst.csv"
 )
 
-MAX_IBANS = 50
-REQUEST_TIMEOUT = 20
-CONCURRENCY = 8
+# Official Bank of Lithuania financial institution codes
+LITHUANIA_CODES_CSV = (
+    "https://www.lb.lt/uploads/documents/files/"
+    "Finans%C5%B3%20%C4%AFstaig%C5%B3%20kod%C5%B3%20%C5%BEinynas.csv"
+)
 
-# Refresh EPC registers every 6 hours
-EPC_REFRESH_SECONDS = 6 * 60 * 60
+MAX_IBANS = 30
+TIMEOUT = 20
+CONCURRENCY = 6
+EPC_REFRESH = 6 * 60 * 60
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("iban-bot")
 
 
 # ============================================================
-# EPC CACHE
+# COUNTRY NAMES
 # ============================================================
 
-class EPCRegister:
-    def __init__(self):
-        self.sct = {}
-        self.sct_inst = {}
-        self.last_update = 0
-        self.lock = asyncio.Lock()
-
-    @staticmethod
-    def normalize(value):
-        if value is None:
-            return ""
-
-        return re.sub(
-            r"[^A-Z0-9]",
-            "",
-            str(value).upper(),
-        )
-
-    async def download_csv(self, session, url):
-        try:
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(
-                    total=60
-                ),
-                headers={
-                    "User-Agent": "Free-IBAN-Telegram-Bot/1.0"
-                },
-            ) as response:
-
-                if response.status != 200:
-                    logger.warning(
-                        "EPC HTTP %s: %s",
-                        response.status,
-                        url,
-                    )
-                    return []
-
-                content = await response.read()
-
-                # EPC CSV may contain BOM
-                text = content.decode(
-                    "utf-8-sig",
-                    errors="replace",
-                )
-
-                # Try semicolon first, then comma.
-                try:
-                    dialect = csv.Sniffer().sniff(
-                        text[:10000],
-                        delimiters=",;"
-                    )
-                except csv.Error:
-                    dialect = csv.excel
-
-                reader = csv.DictReader(
-                    io.StringIO(text),
-                    dialect=dialect,
-                )
-
-                return list(reader)
-
-        except Exception as exc:
-            logger.warning(
-                "EPC download failed: %s",
-                exc,
-            )
-            return []
-
-    def index_rows(self, rows):
-        """
-        Index by BIC/reference BIC.
-
-        EPC explicitly warns that these BICs are reference BICs,
-        not necessarily routing BICs.
-        """
-
-        result = {}
-
-        for row in rows:
-            normalized = {
-                self.normalize(k): (
-                    str(v).strip()
-                    if v is not None
-                    else ""
-                )
-                for k, v in row.items()
-            }
-
-            # EPC files normally contain BIC.
-            possible_bics = [
-                normalized.get("BIC", ""),
-                normalized.get("BIC11", ""),
-                normalized.get("BIC8", ""),
-                normalized.get("BICCODE", ""),
-            ]
-
-            bic = ""
-
-            for candidate in possible_bics:
-                if candidate:
-                    bic = candidate
-                    break
-
-            if bic:
-                result[bic] = normalized
-
-        return result
-
-    async def refresh(self, session, force=False):
-        async with self.lock:
-            now = asyncio.get_running_loop().time()
-
-            if (
-                not force
-                and self.last_update
-                and now - self.last_update
-                < EPC_REFRESH_SECONDS
-            ):
-                return
-
-            logger.info(
-                "Downloading official EPC registers..."
-            )
-
-            sct_rows, instant_rows = await asyncio.gather(
-                self.download_csv(
-                    session,
-                    EPC_SCT_CSV,
-                ),
-                self.download_csv(
-                    session,
-                    EPC_SCT_INST_CSV,
-                ),
-            )
-
-            if sct_rows:
-                self.sct = self.index_rows(
-                    sct_rows
-                )
-
-            if instant_rows:
-                self.sct_inst = self.index_rows(
-                    instant_rows
-                )
-
-            self.last_update = now
-
-            logger.info(
-                "EPC loaded: SCT=%d, SCT_INST=%d",
-                len(self.sct),
-                len(self.sct_inst),
-            )
-
-    def check(self, bic: str):
-        bic = self.normalize(bic)
-
-        if not bic:
-            return {
-                "sct": None,
-                "sct_inst": None,
-            }
-
-        # BIC can be 8 or 11 chars.
-        bic8 = bic[:8]
-
-        sct_match = (
-            bic in self.sct
-            or bic8 in self.sct
-        )
-
-        instant_match = (
-            bic in self.sct_inst
-            or bic8 in self.sct_inst
-        )
-
-        return {
-            "sct": sct_match,
-            "sct_inst": instant_match,
-        }
-
-
-epc = EPCRegister()
+COUNTRIES = {
+    "AT": "النمسا",
+    "BE": "بلجيكا",
+    "BG": "بلغاريا",
+    "CH": "سويسرا",
+    "CY": "قبرص",
+    "CZ": "التشيك",
+    "DE": "ألمانيا",
+    "DK": "الدنمارك",
+    "EE": "إستونيا",
+    "ES": "إسبانيا",
+    "FI": "فنلندا",
+    "FR": "فرنسا",
+    "GB": "المملكة المتحدة",
+    "GR": "اليونان",
+    "HR": "كرواتيا",
+    "HU": "المجر",
+    "IE": "أيرلندا",
+    "IS": "آيسلندا",
+    "IT": "إيطاليا",
+    "LI": "ليختنشتاين",
+    "LT": "ليتوانيا",
+    "LU": "لوكسمبورغ",
+    "LV": "لاتفيا",
+    "MC": "موناكو",
+    "MT": "مالطا",
+    "NL": "هولندا",
+    "NO": "النرويج",
+    "PL": "بولندا",
+    "PT": "البرتغال",
+    "RO": "رومانيا",
+    "SE": "السويد",
+    "SI": "سلوفينيا",
+    "SK": "سلوفاكيا",
+    "SM": "سان مارينو",
+    "VA": "الفاتيكان",
+}
 
 
 # ============================================================
-# IBAN EXTRACTION
+# HELPERS
 # ============================================================
 
-def normalize_iban(value: str) -> str:
+def normalize(value):
+    if value is None:
+        return ""
+
     return re.sub(
-        r"[^A-Za-z0-9]",
+        r"[^A-Z0-9]",
         "",
-        value,
-    ).upper()
-
-
-def is_possible_iban(value: str) -> bool:
-    return bool(
-        re.fullmatch(
-            r"[A-Z]{2}[0-9A-Z]{13,32}",
-            value,
-        )
+        str(value).upper(),
     )
 
 
-def extract_ibans(text: str):
+def normalize_iban(value):
+    return normalize(value)
+
+
+def country_name(code):
+    return COUNTRIES.get(
+        code,
+        code,
+    )
+
+
+def get_field(data, *names):
+    """
+    يبحث عن الحقل حتى لو اختلفت طريقة كتابته.
+    """
+
+    if not isinstance(data, dict):
+        return None
+
+    normalized = {}
+
+    for key, value in data.items():
+        nk = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(key).lower(),
+        )
+
+        normalized[nk] = value
+
+    for name in names:
+        nk = re.sub(
+            r"[^a-z0-9]",
+            "",
+            name.lower(),
+        )
+
+        if nk in normalized:
+            value = normalized[nk]
+
+            if value not in (
+                None,
+                "",
+                "null",
+            ):
+                return value
+
+    return None
+
+
+# ============================================================
+# EXTRACT IBANS
+# ============================================================
+
+def extract_ibans(text):
     found = []
 
-    # Remove spaces from possible IBAN groups.
+    # البحث عن IBAN مع احتمال وجود مسافات
     candidates = re.findall(
         r"\b[A-Za-z]{2}[0-9A-Za-z\s]{13,40}\b",
         text,
@@ -280,17 +190,23 @@ def extract_ibans(text: str):
         iban = normalize_iban(candidate)
 
         if (
-            is_possible_iban(iban)
+            re.fullmatch(
+                r"[A-Z]{2}[0-9A-Z]{13,32}",
+                iban,
+            )
             and iban not in found
         ):
             found.append(iban)
 
-    # Fallback token-by-token
+    # fallback
     for token in text.split():
         iban = normalize_iban(token)
 
         if (
-            is_possible_iban(iban)
+            re.fullmatch(
+                r"[A-Z]{2}[0-9A-Z]{13,32}",
+                iban,
+            )
             and iban not in found
         ):
             found.append(iban)
@@ -299,7 +215,301 @@ def extract_ibans(text: str):
 
 
 # ============================================================
-# IBANTOOLS
+# EPC DATABASE
+# ============================================================
+
+class EPCDatabase:
+
+    def __init__(self):
+        self.sct = {}
+        self.instant = {}
+        self.updated = 0
+        self.lock = asyncio.Lock()
+
+    async def download(self, session, url):
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(
+                    total=60
+                ),
+                headers={
+                    "User-Agent": "Free-IBAN-Bot/1.0"
+                },
+            ) as response:
+
+                if response.status != 200:
+                    logger.warning(
+                        "EPC download HTTP %s",
+                        response.status,
+                    )
+                    return []
+
+                raw = await response.read()
+
+                text = raw.decode(
+                    "utf-8-sig",
+                    errors="replace",
+                )
+
+                # EPC CSV normally uses ;
+                try:
+                    dialect = csv.Sniffer().sniff(
+                        text[:10000],
+                        delimiters=";,"
+                    )
+                except Exception:
+                    dialect = csv.excel
+
+                return list(
+                    csv.DictReader(
+                        io.StringIO(text),
+                        dialect=dialect,
+                    )
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "EPC download error: %s",
+                exc,
+            )
+            return []
+
+    def index(self, rows):
+        database = {}
+
+        for row in rows:
+            clean = {}
+
+            for key, value in row.items():
+                clean[
+                    re.sub(
+                        r"[^A-Z0-9]",
+                        "",
+                        str(key).upper(),
+                    )
+                ] = (
+                    str(value).strip()
+                    if value is not None
+                    else ""
+                )
+
+            bic = (
+                clean.get("BIC")
+                or clean.get("BIC11")
+                or clean.get("BIC8")
+                or clean.get("BICCODE")
+            )
+
+            if not bic:
+                continue
+
+            bic = normalize(bic)
+
+            database[bic] = clean
+
+        return database
+
+    async def refresh(self, session):
+        now = asyncio.get_running_loop().time()
+
+        if (
+            self.updated
+            and now - self.updated < EPC_REFRESH
+        ):
+            return
+
+        async with self.lock:
+
+            now = asyncio.get_running_loop().time()
+
+            if (
+                self.updated
+                and now - self.updated < EPC_REFRESH
+            ):
+                return
+
+            logger.info(
+                "Updating official EPC registers..."
+            )
+
+            sct_rows, instant_rows = await asyncio.gather(
+                self.download(
+                    session,
+                    EPC_SCT_CSV,
+                ),
+                self.download(
+                    session,
+                    EPC_SCT_INST_CSV,
+                ),
+            )
+
+            if sct_rows:
+                self.sct = self.index(
+                    sct_rows
+                )
+
+            if instant_rows:
+                self.instant = self.index(
+                    instant_rows
+                )
+
+            self.updated = now
+
+            logger.info(
+                "EPC: SCT=%s SCT_INST=%s",
+                len(self.sct),
+                len(self.instant),
+            )
+
+    def check_bic(self, bic):
+        if not bic:
+            return {
+                "sct": None,
+                "instant": None,
+                "sct_data": {},
+                "instant_data": {},
+            }
+
+        bic = normalize(bic)
+        bic8 = bic[:8]
+
+        sct_data = (
+            self.sct.get(bic)
+            or self.sct.get(bic8)
+            or {}
+        )
+
+        instant_data = (
+            self.instant.get(bic)
+            or self.instant.get(bic8)
+            or {}
+        )
+
+        return {
+            "sct": bool(sct_data),
+            "instant": bool(instant_data),
+            "sct_data": sct_data,
+            "instant_data": instant_data,
+        }
+
+
+epc = EPCDatabase()
+
+
+# ============================================================
+# LITHUANIA BANK CODE DATABASE
+# ============================================================
+
+class LithuaniaDatabase:
+
+    def __init__(self):
+        self.data = {}
+        self.updated = 0
+
+    async def refresh(self, session):
+        """
+        محاولة تحميل سجل بنك ليتوانيا الرسمي.
+
+        إذا تغير رابط الملف مستقبلاً، يبقى IBANTools
+        كـ fallback.
+        """
+
+        try:
+            async with session.get(
+                LITHUANIA_CODES_CSV,
+                timeout=aiohttp.ClientTimeout(
+                    total=60
+                ),
+            ) as response:
+
+                if response.status != 200:
+                    logger.warning(
+                        "Lithuania CSV HTTP %s",
+                        response.status,
+                    )
+                    return
+
+                raw = await response.read()
+
+                text = raw.decode(
+                    "utf-8-sig",
+                    errors="replace",
+                )
+
+                # Lithuanian official file can change delimiter.
+                try:
+                    dialect = csv.Sniffer().sniff(
+                        text[:10000],
+                        delimiters=";,\t"
+                    )
+                except Exception:
+                    dialect = csv.excel
+
+                rows = csv.DictReader(
+                    io.StringIO(text),
+                    dialect=dialect,
+                )
+
+                self.data = {}
+
+                for row in rows:
+
+                    clean = {}
+
+                    for key, value in row.items():
+                        key_clean = re.sub(
+                            r"[^A-Z0-9]",
+                            "",
+                            str(key).upper(),
+                        )
+
+                        clean[key_clean] = (
+                            str(value).strip()
+                            if value is not None
+                            else ""
+                        )
+
+                    # Find a 5-digit financial institution code
+                    possible = []
+
+                    for key, value in clean.items():
+                        if (
+                            value.isdigit()
+                            and len(value) == 5
+                        ):
+                            possible.append(value)
+
+                    for code in possible:
+                        self.data[code] = clean
+
+                self.updated = (
+                    asyncio.get_running_loop().time()
+                )
+
+                logger.info(
+                    "Lithuania financial codes loaded: %s",
+                    len(self.data),
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "Lithuania database error: %s",
+                exc,
+            )
+
+    def lookup(self, code):
+        return self.data.get(
+            normalize(code),
+            {},
+        )
+
+
+lt_db = LithuaniaDatabase()
+
+
+# ============================================================
+# IBANTools VALIDATION
 # ============================================================
 
 async def validate_iban(
@@ -307,16 +517,18 @@ async def validate_iban(
     semaphore,
     iban,
 ):
+
     async with semaphore:
+
         try:
-            url = IBANTOOLS_VALIDATE_URL.format(
+            url = IBANTOOLS_VALIDATE.format(
                 iban
             )
 
             async with session.get(
                 url,
                 timeout=aiohttp.ClientTimeout(
-                    total=REQUEST_TIMEOUT
+                    total=TIMEOUT
                 ),
             ) as response:
 
@@ -344,289 +556,227 @@ async def validate_iban(
 
         except Exception as exc:
             logger.warning(
-                "IBAN validation error: %s",
+                "Validation error: %s",
                 exc,
             )
 
             return {
                 "iban": iban,
-                "error": "تعذر الاتصال بخدمة التحقق",
+                "error": "تعذر الاتصال بخدمة IBANTools",
             }
 
 
 # ============================================================
-# SWIFT / BIC SEARCH
+# SWIFT LOOKUP
 # ============================================================
 
-async def search_bic(
+async def swift_lookup(
     session,
     semaphore,
-    query,
-    country,
+    bic,
 ):
-    """
-    IBANTools يسمح بالبحث عن SWIFT/BIC
-    حسب البنك أو المدينة أو الكود.
 
-    هذا البحث ليس تخمينًا، لكنه قد يرجع عدة نتائج.
-    """
-
-    if not query:
-        return []
+    if not bic:
+        return {}
 
     async with semaphore:
+
         try:
+            url = IBANTOOLS_SWIFT.format(
+                normalize(bic)
+            )
+
             async with session.get(
-                IBANTOOLS_SWIFT_SEARCH_URL,
-                params={
-                    "q": query,
-                    "country": country,
-                },
+                url,
                 timeout=aiohttp.ClientTimeout(
-                    total=REQUEST_TIMEOUT
+                    total=TIMEOUT
                 ),
             ) as response:
 
                 if response.status != 200:
-                    return []
+                    return {}
 
                 data = await response.json()
 
-                if isinstance(data, list):
+                if isinstance(data, dict):
                     return data
 
-                if isinstance(data, dict):
-                    for key in (
-                        "results",
-                        "data",
-                        "swifts",
-                    ):
-                        if isinstance(
-                            data.get(key),
-                            list,
-                        ):
-                            return data[key]
-
-                return []
+                return {}
 
         except Exception:
-            return []
+            return {}
 
 
 # ============================================================
-# COUNTRY
+# GET BANK INFORMATION
 # ============================================================
 
-COUNTRIES = {
-    "AT": "النمسا",
-    "BE": "بلجيكا",
-    "BG": "بلغاريا",
-    "CH": "سويسرا",
-    "CY": "قبرص",
-    "CZ": "التشيك",
-    "DE": "ألمانيا",
-    "DK": "الدنمارك",
-    "EE": "إستونيا",
-    "ES": "إسبانيا",
-    "FI": "فنلندا",
-    "FR": "فرنسا",
-    "GR": "اليونان",
-    "HR": "كرواتيا",
-    "HU": "المجر",
-    "IE": "أيرلندا",
-    "IS": "آيسلندا",
-    "IT": "إيطاليا",
-    "LI": "ليختنشتاين",
-    "LT": "ليتوانيا",
-    "LU": "لوكسمبورغ",
-    "LV": "لاتفيا",
-    "MC": "موناكو",
-    "MT": "مالطا",
-    "NL": "هولندا",
-    "NO": "النرويج",
-    "PL": "بولندا",
-    "PT": "البرتغال",
-    "RO": "رومانيا",
-    "SE": "السويد",
-    "SI": "سلوفينيا",
-    "SK": "سلوفاكيا",
-    "SM": "سان مارينو",
-    "VA": "الفاتيكان",
-    "GB": "المملكة المتحدة",
-}
-
-
-def country_name(code):
-    return COUNTRIES.get(
-        code,
-        code,
-    )
-
-
-# ============================================================
-# GET FIELD
-# ============================================================
-
-def get_first(data, names):
-    """
-    لأن أسماء الحقول قد تختلف حسب استجابة API.
-    """
-
-    if not isinstance(data, dict):
-        return None
-
-    normalized = {
-        re.sub(
-            r"[^a-z0-9]",
-            "",
-            str(k).lower(),
-        ): v
-        for k, v in data.items()
-    }
-
-    for name in names:
-        key = re.sub(
-            r"[^a-z0-9]",
-            "",
-            name.lower(),
-        )
-
-        value = normalized.get(key)
-
-        if value not in (
-            None,
-            "",
-            "null",
-        ):
-            return value
-
-    return None
-
-
-# ============================================================
-# FIND BIC
-# ============================================================
-
-async def get_bic(
+async def get_bank_info(
     session,
     semaphore,
-    iban_data,
-    country,
+    iban,
+    data,
 ):
-    """
-    نحاول أولًا أخذ BIC من استجابة IBANTools
-    إن توفر.
 
-    إذا لم يتوفر، نبحث باستخدام bank code.
-    """
+    country = iban[:2]
 
-    bic = get_first(
-        iban_data,
-        [
-            "bic",
-            "swift",
-            "swift_code",
-            "bic_code",
-        ],
+    bank_code = get_field(
+        data,
+        "bank_code",
+        "bankcode",
     )
+
+    bic = get_field(
+        data,
+        "bic",
+        "swift",
+        "swift_code",
+        "bic_code",
+    )
+
+    bank_name = get_field(
+        data,
+        "bank_name",
+        "bank",
+        "institution",
+        "name",
+    )
+
+    city = get_field(
+        data,
+        "city",
+        "bank_city",
+    )
+
+    address = get_field(
+        data,
+        "address",
+        "bank_address",
+    )
+
+    postal = get_field(
+        data,
+        "postal_code",
+        "zip",
+        "postcode",
+    )
+
+    # --------------------------------------------------------
+    # Lithuania official database
+    # --------------------------------------------------------
+
+    if country == "LT" and bank_code:
+
+        lt = lt_db.lookup(
+            str(bank_code)
+        )
+
+        if lt:
+
+            # Try common field names
+            bank_name = (
+                bank_name
+                or lt.get("PAVADINIMAS")
+                or lt.get("PAVADINIMASEN")
+                or lt.get("NAME")
+                or lt.get("BANKNAME")
+            )
+
+            bic = (
+                bic
+                or lt.get("BIC")
+                or lt.get("SWIFT")
+            )
+
+            city = (
+                city
+                or lt.get("MIESTAS")
+                or lt.get("CITY")
+            )
+
+            address = (
+                address
+                or lt.get("ADRESAS")
+                or lt.get("ADDRESS")
+            )
+
+            postal = (
+                postal
+                or lt.get("PASTOADRESAS")
+                or lt.get("POSTALCODE")
+                or lt.get("ZIP")
+            )
+
+    # --------------------------------------------------------
+    # If BIC exists, get detailed BIC information
+    # --------------------------------------------------------
 
     if bic:
-        return {
-            "bic": str(bic).upper(),
-            "bank": get_first(
-                iban_data,
-                [
-                    "bank_name",
-                    "bank",
-                    "name",
-                ],
-            ),
-            "address": get_first(
-                iban_data,
-                [
-                    "address",
-                    "bank_address",
-                ],
-            ),
-            "city": get_first(
-                iban_data,
-                [
-                    "city",
-                    "bank_city",
-                ],
-            ),
-        }
 
-    bank_code = get_first(
-        iban_data,
-        [
-            "bank_code",
-            "bankcode",
-        ],
-    )
+        swift_data = await swift_lookup(
+            session,
+            semaphore,
+            str(bic),
+        )
 
-    if not bank_code:
-        return {}
-
-    results = await search_bic(
-        session,
-        semaphore,
-        str(bank_code),
-        country,
-    )
-
-    if not results:
-        return {}
-
-    # نختار أول نتيجة مطابقة للدولة.
-    item = results[0]
-
-    if not isinstance(item, dict):
-        return {}
-
-    return {
-        "bic": get_first(
-            item,
-            [
-                "bic",
-                "swift",
-                "swift_code",
-            ],
-        ),
-        "bank": get_first(
-            item,
-            [
+        bank_name = (
+            bank_name
+            or get_field(
+                swift_data,
                 "bank_name",
                 "name",
                 "institution",
-            ],
-        ),
-        "address": get_first(
-            item,
-            [
-                "address",
-                "bank_address",
-            ],
-        ),
-        "city": get_first(
-            item,
-            [
+            )
+        )
+
+        city = (
+            city
+            or get_field(
+                swift_data,
                 "city",
                 "bank_city",
-            ],
-        ),
+            )
+        )
+
+        address = (
+            address
+            or get_field(
+                swift_data,
+                "address",
+                "bank_address",
+            )
+        )
+
+        postal = (
+            postal
+            or get_field(
+                swift_data,
+                "postal_code",
+                "zip",
+                "postcode",
+            )
+        )
+
+    return {
+        "bank_code": bank_code,
+        "bic": bic,
+        "bank_name": bank_name,
+        "city": city,
+        "address": address,
+        "postal": postal,
     }
 
 
 # ============================================================
-# FORMAT
+# FORMAT RESULT
 # ============================================================
 
 def format_result(
     result,
-    bank_info,
-    sepa_info,
+    bank,
+    sepa,
 ):
+
     iban = result["iban"]
 
     if "error" in result:
@@ -637,12 +787,10 @@ def format_result(
 
     data = result.get("data") or {}
 
-    valid = get_first(
+    valid = get_field(
         data,
-        [
-            "valid",
-            "is_valid",
-        ],
+        "valid",
+        "is_valid",
     )
 
     country = iban[:2]
@@ -654,36 +802,33 @@ def format_result(
             f"• الدولة: {country_name(country)}"
         )
 
-    bank_code = get_first(
-        data,
-        [
-            "bank_code",
-            "bankcode",
-        ],
-    )
+    bank_code = bank.get(
+        "bank_code"
+    ) or "غير متوفر"
 
-    branch_code = get_first(
-        data,
-        [
-            "branch_code",
-            "branchcode",
-        ],
-    )
+    bic = bank.get(
+        "bic"
+    ) or "غير متوفر"
 
-    bic = bank_info.get("bic")
-    bank = bank_info.get("bank")
-    address = bank_info.get("address")
-    city = bank_info.get("city")
+    bank_name = bank.get(
+        "bank_name"
+    ) or "غير متوفر"
 
-    bank = bank or "غير متوفر"
-    bic = bic or "غير متوفر"
-    address = address or "غير متوفر"
-    city = city or "غير متوفر"
-    bank_code = bank_code or "غير متوفر"
-    branch_code = branch_code or "غير متوفر"
+    city = bank.get(
+        "city"
+    ) or "غير متوفر"
 
-    sct = sepa_info.get("sct")
-    instant = sepa_info.get("sct_inst")
+    address = bank.get(
+        "address"
+    ) or "غير متوفر"
+
+    postal = bank.get(
+        "postal"
+    ) or "غير متوفر"
+
+    sct = sepa["sct"]
+
+    instant = sepa["instant"]
 
     sct_text = (
         "✅ نعم"
@@ -703,50 +848,57 @@ def format_result(
 
     return (
         f"✅ <code>{iban}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"• الحالة: <b>IBAN صالح</b>\n"
         f"• الدولة: {country_name(country)} "
         f"(<code>{country}</code>)\n"
-        f"• البنك: {bank}\n"
+        f"• Bank Code: <code>{bank_code}</code>\n\n"
+
+        f"🏦 <b>البنك</b>\n"
+        f"• الاسم: {bank_name}\n"
         f"• BIC/SWIFT: <code>{bic}</code>\n"
-        f"• Bank Code: <code>{bank_code}</code>\n"
-        f"• Branch Code: <code>{branch_code}</code>\n"
         f"• المدينة: {city}\n"
-        f"• العنوان: {address}\n\n"
+        f"• العنوان: {address}\n"
+        f"• الرمز البريدي: {postal}\n\n"
+
         f"💶 <b>SEPA Normal (SCT):</b> "
         f"{sct_text}\n"
         f"⚡ <b>SEPA Instant (SCT Inst):</b> "
         f"{instant_text}\n\n"
-        f"ℹ️ RT1/TIPS: لا يتم تخمينهما من هذه البيانات."
+
+        f"ℹ️ <i>SEPA يعتمد على سجل EPC "
+        f"الرسمي، وليس على تخمين اسم البنك.</i>"
     )
 
 
 # ============================================================
-# TELEGRAM HANDLER
+# TELEGRAM
 # ============================================================
 
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.message:
         return
 
-    text = update.message.text or ""
+    text = (
+        update.message.text
+        or ""
+    ).strip()
 
     ibans = extract_ibans(text)
 
     if not ibans:
         await update.message.reply_text(
-            "❌ لم أجد IBAN في الرسالة.\n\n"
-            "مثال:\n"
-            "<code>LT303250098266887526</code>",
-            parse_mode=ParseMode.HTML,
+            "❌ أرسل IBAN واحدًا أو قائمة IBANs."
         )
         return
 
     if len(ibans) > MAX_IBANS:
         await update.message.reply_text(
-            f"❌ الحد الأقصى هو {MAX_IBANS} IBAN."
+            f"❌ الحد الأقصى {MAX_IBANS} IBAN."
         )
         return
 
@@ -754,27 +906,30 @@ async def handle_message(
         f"⏳ جاري التحقق من {len(ibans)} IBAN..."
     )
 
-    connector = aiohttp.TCPConnector(
-        limit=CONCURRENCY
-    )
-
     semaphore = asyncio.Semaphore(
         CONCURRENCY
+    )
+
+    connector = aiohttp.TCPConnector(
+        limit=CONCURRENCY
     )
 
     async with aiohttp.ClientSession(
         connector=connector,
         headers={
             "User-Agent":
-                "Free-IBAN-Telegram-Bot/1.0"
+                "Free-IBAN-Telegram-Bot/2.0"
         },
     ) as session:
 
-        # تحديث EPC
+        # تحديث قواعد EPC
         await epc.refresh(session)
 
-        # تحقق IBANs
-        validation_tasks = [
+        # تحديث قاعدة ليتوانيا
+        await lt_db.refresh(session)
+
+        # تحقق IBAN
+        tasks = [
             validate_iban(
                 session,
                 semaphore,
@@ -784,50 +939,55 @@ async def handle_message(
         ]
 
         results = await asyncio.gather(
-            *validation_tasks
+            *tasks
         )
 
-        output = []
+        formatted = []
 
         for result in results:
 
             if "error" in result:
-                output.append(
+
+                formatted.append(
                     format_result(
                         result,
                         {},
                         {
                             "sct": None,
-                            "sct_inst": None,
+                            "instant": None,
                         },
                     )
                 )
+
                 continue
 
-            data = result.get("data") or {}
+            data = result.get(
+                "data"
+            ) or {}
 
-            country = result["iban"][:2]
-
-            # الحصول على BIC/بيانات البنك
-            bank_info = await get_bic(
+            bank = await get_bank_info(
                 session,
                 semaphore,
+                result["iban"],
                 data,
-                country,
             )
 
-            bic = bank_info.get("bic")
-
-            # SEPA من EPC
-            sepa_info = epc.check(
-                bic or ""
+            bic = bank.get(
+                "bic"
             )
 
-            output.append(
+            sepa = epc.check_bic(
+                bic
+            )
+
+            formatted.append(
                 format_result(
                     result,
-                    bank_info,
-                    sepa_info,
+                    bank,
+                    {
+                        "sct": sepa["sct"],
+                        "instant": sepa["instant"],
+                    },
                 )
             )
 
@@ -836,55 +996,65 @@ async def handle_message(
         "━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    body = "\n\n━━━━━━━━━━━━━━━━━━━━\n\n".join(
-        output
+    body = (
+        "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        .join(formatted)
     )
 
     footer = (
         "\n\n━━━━━━━━━━━━━━━━━━━━\n"
-        "🆓 <b>المصادر:</b> IBANTools + EPC\n"
-        "ℹ️ SEPA/SCT وSCT Inst مبنيان على "
-        "سجلات EPC الرسمية.\n"
-        "⚠️ صلاحية IBAN لا تعني أن الحساب مفتوح "
-        "أو يحتوي على أموال."
+        "🆓 مجاني — لا يحتاج API Key\n"
+        "⚠️ صلاحية IBAN لا تعني أن الحساب "
+        "مفتوح أو يحتوي على رصيد.\n"
+        "⚠️ BIC في EPC هو Reference BIC."
     )
 
-    final = header + body + footer
+    final = (
+        header
+        + body
+        + footer
+    )
 
-    # Telegram limit
     if len(final) <= 4000:
+
         await wait.edit_text(
             final,
             parse_mode=ParseMode.HTML,
         )
-        return
 
-    # إرسال مقسم
-    await wait.delete()
+    else:
 
-    chunks = []
-    current = header
+        await wait.delete()
 
-    for item in output:
-        part = item + "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        chunks = []
+        current = header
 
-        if len(current) + len(part) > 3800:
+        for item in formatted:
+
+            part = (
+                item
+                + "\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+            )
+
+            if len(current) + len(part) > 3700:
+                chunks.append(current)
+                current = part
+            else:
+                current += part
+
+        if current:
             chunks.append(current)
-            current = part
-        else:
-            current += part
 
-    if current:
-        chunks.append(current)
+        for i, chunk in enumerate(chunks):
 
-    for index, chunk in enumerate(chunks):
-        if index == len(chunks) - 1:
-            chunk += footer
+            if i == len(chunks) - 1:
+                chunk += footer
 
-        await update.message.reply_text(
-            chunk,
-            parse_mode=ParseMode.HTML,
-        )
+            await update.message.reply_text(
+                chunk,
+                parse_mode=ParseMode.HTML,
+            )
 
 
 # ============================================================
@@ -892,26 +1062,28 @@ async def handle_message(
 # ============================================================
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
+
+    if not TOKEN:
         raise RuntimeError(
-            "ضع TELEGRAM_BOT_TOKEN في متغير البيئة."
+            "TELEGRAM_BOT_TOKEN غير موجود."
         )
 
     application = (
         ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
+        .token(TOKEN)
         .build()
     )
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & (~filters.COMMAND),
+            filters.TEXT
+            & (~filters.COMMAND),
             handle_message,
         )
     )
 
     logger.info(
-        "Free IBAN Telegram Bot started."
+        "Free IBAN checker started."
     )
 
     application.run_polling()
