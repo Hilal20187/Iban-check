@@ -7,6 +7,7 @@ from http import HTTPStatus
 
 import aiohttp
 from bs4 import BeautifulSoup
+import uvicorn
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -27,20 +28,19 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+PORT = int(
+    os.getenv("PORT", "10000")
+)
+
 RENDER_EXTERNAL_URL = os.getenv(
     "RENDER_EXTERNAL_URL",
     ""
-).rstrip("/")
+).strip().rstrip("/")
 
 WEBHOOK_SECRET = os.getenv(
     "TELEGRAM_WEBHOOK_SECRET",
     ""
-)
-
-# Render provides PORT automatically.
-PORT = int(
-    os.getenv("PORT", "10000")
-)
+).strip()
 
 BASE_URL = (
     "https://www.ibancalculator.com/validate/"
@@ -58,12 +58,12 @@ logger = logging.getLogger(
     "LEX-IBAN-BOT"
 )
 
+
 # =========================================================
 # GLOBALS
 # =========================================================
 
 telegram_app = None
-http_server = None
 
 
 # =========================================================
@@ -71,6 +71,7 @@ http_server = None
 # =========================================================
 
 def clean_iban(value: str) -> str:
+
     return re.sub(
         r"[^A-Z0-9]",
         "",
@@ -104,7 +105,6 @@ def extract_ibans(text: str):
         ):
             found.append(iban)
 
-    # Also check individual words
     for word in text.split():
 
         iban = clean_iban(word)
@@ -175,9 +175,7 @@ def iban_checksum_valid(
 # HTML PARSING
 # =========================================================
 
-def get_clean_soup(
-    html: str
-):
+def get_clean_soup(html: str):
 
     soup = BeautifulSoup(
         html,
@@ -246,13 +244,10 @@ def is_bad_value(value):
         "bank identifier",
     ]
 
-    if any(
+    return any(
         item in low
         for item in bad_fragments
-    ):
-        return True
-
-    return False
+    )
 
 
 def get_label_value(
@@ -265,7 +260,10 @@ def get_label_value(
         for item in labels
     }
 
-    # Table extraction
+    # -----------------------------------------------------
+    # TABLE
+    # -----------------------------------------------------
+
     for row in soup.find_all("tr"):
 
         cells = row.find_all(
@@ -300,7 +298,10 @@ def get_label_value(
             if not is_bad_value(value):
                 return value
 
-    # Definition list
+    # -----------------------------------------------------
+    # LABEL / DT
+    # -----------------------------------------------------
+
     for element in soup.find_all(
         ["label", "dt"]
     ):
@@ -337,7 +338,10 @@ def get_label_value(
             if not is_bad_value(value):
                 return value
 
-    # Strong / bold labels
+    # -----------------------------------------------------
+    # BOLD / STRONG
+    # -----------------------------------------------------
+
     for element in soup.find_all(
         ["strong", "b"]
     ):
@@ -381,7 +385,10 @@ def get_label_value(
                 if not is_bad_value(value):
                     return value
 
-    # Exact label:value extraction
+    # -----------------------------------------------------
+    # TEXT label:value
+    # -----------------------------------------------------
+
     for element in soup.find_all(
         [
             "p",
@@ -588,7 +595,7 @@ def extract_address(soup):
 
 
 # =========================================================
-# SEPA SUPPORT
+# SEPA
 # =========================================================
 
 def detect_support(
@@ -616,16 +623,14 @@ def detect_support(
         if re.search(
             p
             + r"\s+(?:is\s+)?supported\b",
-            text,
-            re.IGNORECASE
+            text
         ):
             return True
 
         if re.search(
             p
             + r"\s+(?:is\s+)?not\s+supported\b",
-            text,
-            re.IGNORECASE
+            text
         ):
             return False
 
@@ -633,8 +638,7 @@ def detect_support(
             p
             + r".{0,40}"
             + r"(nicht unterstützt|nicht unterstuetzt)",
-            text,
-            re.IGNORECASE
+            text
         ):
             return False
 
@@ -642,8 +646,7 @@ def detect_support(
             p
             + r".{0,40}"
             + r"(unterstützt|unterstuetzt)",
-            text,
-            re.IGNORECASE
+            text
         ):
             return True
 
@@ -651,7 +654,7 @@ def detect_support(
 
 
 # =========================================================
-# PAGE PARSER
+# PARSER
 # =========================================================
 
 def parse_result(
@@ -710,55 +713,36 @@ def parse_result(
 
         result["valid"] = False
 
-    result["bank"] = extract_bank(
-        soup
-    )
-
-    result["bic"] = extract_bic(
-        soup
-    )
-
-    result["branch"] = extract_branch(
-        soup
-    )
-
-    result["address"] = extract_address(
-        soup
-    )
+    result["bank"] = extract_bank(soup)
+    result["bic"] = extract_bic(soup)
+    result["branch"] = extract_branch(soup)
+    result["address"] = extract_address(soup)
 
     result["sepa"] = detect_support(
         soup,
-        [
-            "SEPA Credit Transfer"
-        ]
+        ["SEPA Credit Transfer"]
     )
 
     result["direct_debit"] = detect_support(
         soup,
-        [
-            "SEPA Direct Debit"
-        ]
+        ["SEPA Direct Debit"]
     )
 
     result["b2b"] = detect_support(
         soup,
-        [
-            "B2B"
-        ]
+        ["B2B"]
     )
 
     result["instant"] = detect_support(
         soup,
-        [
-            "SEPA Instant Credit Transfer"
-        ]
+        ["SEPA Instant Credit Transfer"]
     )
 
     return result
 
 
 # =========================================================
-# IBAN WEBSITE REQUEST
+# CHECK IBAN
 # =========================================================
 
 async def check_iban(
@@ -832,7 +816,7 @@ async def check_iban(
 
 
 # =========================================================
-# RESULT FORMAT
+# FORMAT
 # =========================================================
 
 def support_text(value):
@@ -875,12 +859,14 @@ def format_result(data):
 
     else:
 
-        if iban_checksum_valid(
-            data["iban"]
-        ):
-            status = "Technically valid"
-        else:
-            status = "Technically invalid"
+        status = (
+            "Technically valid"
+            if iban_checksum_valid(
+                data["iban"]
+            )
+            else
+            "Technically invalid"
+        )
 
     bank = escape(
         data.get("bank")
@@ -897,13 +883,9 @@ def format_result(data):
         or "Not available"
     )
 
-    address = (
+    address = escape(
         data.get("address")
         or "Not available"
-    )
-
-    address = escape(
-        address
     ).replace(
         "\n",
         "<br>"
@@ -1004,8 +986,6 @@ async def handle_message(
                 format_result(result)
             )
 
-            # Small delay to avoid
-            # hammering the source.
             await asyncio.sleep(1)
 
     final_text = (
@@ -1027,40 +1007,29 @@ async def handle_message(
             parse_mode="HTML"
         )
 
-    except Exception:
+    except Exception as error:
 
-        await update.message.reply_text(
-            final_text,
-            parse_mode="HTML"
+        logger.warning(
+            "Could not edit result message: %s",
+            error
         )
 
+        try:
 
-# =========================================================
-# HEALTH CHECK
-# =========================================================
+            await update.message.reply_text(
+                final_text,
+                parse_mode="HTML"
+            )
 
-async def health_check(
-    request: Request
-):
+        except Exception:
 
-    return PlainTextResponse(
-        "LEX IBAN Bot is running.",
-        status_code=HTTPStatus.OK
-    )
-
-
-async def root(
-    request: Request
-):
-
-    return PlainTextResponse(
-        "LEX IBAN Bot",
-        status_code=HTTPStatus.OK
-    )
+            logger.exception(
+                "Could not send final result."
+            )
 
 
 # =========================================================
-# TELEGRAM WEBHOOK
+# WEBHOOK
 # =========================================================
 
 async def telegram_webhook(
@@ -1069,20 +1038,13 @@ async def telegram_webhook(
 
     global telegram_app
 
-    # Make sure Telegram application
-    # is initialized.
     if telegram_app is None:
 
-        logger.error(
-            "Telegram application is not ready."
-        )
-
         return PlainTextResponse(
-            "Service Unavailable",
+            "Bot is starting",
             status_code=HTTPStatus.SERVICE_UNAVAILABLE
         )
 
-    # Verify Telegram secret token
     if WEBHOOK_SECRET:
 
         received_secret = request.headers.get(
@@ -1093,7 +1055,7 @@ async def telegram_webhook(
         if received_secret != WEBHOOK_SECRET:
 
             logger.warning(
-                "Invalid Telegram webhook secret."
+                "Invalid webhook secret."
             )
 
             return PlainTextResponse(
@@ -1110,6 +1072,7 @@ async def telegram_webhook(
             bot=telegram_app.bot
         )
 
+        # Put update into PTB queue.
         await telegram_app.update_queue.put(
             update
         )
@@ -1133,46 +1096,62 @@ async def telegram_webhook(
 
 
 # =========================================================
-# STARLETTE APP
+# HEALTH
 # =========================================================
 
-routes = [
-    Route(
-        "/",
-        root,
-        methods=["GET"]
-    ),
-    Route(
-        "/health",
-        health_check,
-        methods=["GET"]
-    ),
-    Route(
-        "/telegram",
-        telegram_webhook,
-        methods=["POST"]
-    ),
-]
+async def health_check(
+    request: Request
+):
+
+    return PlainTextResponse(
+        "LEX IBAN Bot is running.",
+        status_code=HTTPStatus.OK
+    )
+
+
+async def root(
+    request: Request
+):
+
+    return PlainTextResponse(
+        "LEX IBAN Bot",
+        status_code=HTTPStatus.OK
+    )
+
+
+# =========================================================
+# STARLETTE
+# =========================================================
 
 web_app = Starlette(
-    routes=routes
+    routes=[
+        Route(
+            "/",
+            root,
+            methods=["GET"]
+        ),
+        Route(
+            "/health",
+            health_check,
+            methods=["GET"]
+        ),
+        Route(
+            "/telegram",
+            telegram_webhook,
+            methods=["POST"]
+        ),
+    ]
 )
 
 
 # =========================================================
-# STARTUP
+# SERVER
 # =========================================================
 
-@web_app.on_event("startup")
-async def startup():
+async def run_server():
 
     global telegram_app
 
-    logger.info(
-        "Starting LEX IBAN Bot..."
-    )
-
-    # Validate environment
     if not TOKEN:
 
         raise RuntimeError(
@@ -1191,16 +1170,31 @@ async def startup():
     )
 
     logger.info(
-        "Render URL: %s",
-        RENDER_EXTERNAL_URL
+        "========================================"
     )
 
     logger.info(
-        "Webhook URL: %s",
+        "Starting LEX IBAN Bot"
+    )
+
+    logger.info(
+        "Port: %s",
+        PORT
+    )
+
+    logger.info(
+        "Webhook: %s",
         webhook_url
     )
 
-    # Create Telegram application
+    logger.info(
+        "========================================"
+    )
+
+    # -----------------------------------------------------
+    # Telegram application
+    # -----------------------------------------------------
+
     telegram_app = (
         Application.builder()
         .token(TOKEN)
@@ -1216,115 +1210,132 @@ async def startup():
         )
     )
 
-    # Initialize Telegram application
+    # IMPORTANT:
+    # initialize + start keeps the update queue
+    # and dispatcher running.
     await telegram_app.initialize()
 
-    # Start Telegram application
     await telegram_app.start()
 
-    # Configure webhook
-    webhook_kwargs = {
-        "url": webhook_url,
-        "allowed_updates": (
-            Update.ALL_TYPES
-        ),
-        "drop_pending_updates": True,
-    }
-
-    if WEBHOOK_SECRET:
-
-        webhook_kwargs[
-            "secret_token"
-        ] = WEBHOOK_SECRET
-
-    await telegram_app.bot.set_webhook(
-        **webhook_kwargs
-    )
-
-    logger.info(
-        "Telegram webhook configured."
-    )
-
-    logger.info(
-        "LEX IBAN Bot is ready."
-    )
-
-
-# =========================================================
-# SHUTDOWN
-# =========================================================
-
-@web_app.on_event("shutdown")
-async def shutdown():
-
-    global telegram_app
-
-    logger.info(
-        "Graceful shutdown started..."
-    )
-
-    if telegram_app is None:
-
-        logger.info(
-            "Telegram application already stopped."
-        )
-
-        return
-
     try:
 
-        # Remove webhook cleanly
-        await telegram_app.bot.delete_webhook(
-            drop_pending_updates=False
+        # -------------------------------------------------
+        # Webhook
+        # -------------------------------------------------
+
+        webhook_args = {
+            "url": webhook_url,
+            "allowed_updates": Update.ALL_TYPES,
+            "drop_pending_updates": True,
+        }
+
+        if WEBHOOK_SECRET:
+
+            webhook_args[
+                "secret_token"
+            ] = WEBHOOK_SECRET
+
+        await telegram_app.bot.set_webhook(
+            **webhook_args
         )
 
         logger.info(
-            "Telegram webhook removed."
+            "Telegram webhook successfully configured."
         )
 
-    except Exception as error:
+        # -------------------------------------------------
+        # Uvicorn
+        # -------------------------------------------------
 
-        logger.exception(
-            "Failed to delete Telegram webhook: %s",
-            error
+        config = uvicorn.Config(
+            web_app,
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info",
+            access_log=True,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+            timeout_keep_alive=15,
         )
 
-    try:
-
-        # Stop receiving/processing updates
-        await telegram_app.stop()
+        server = uvicorn.Server(
+            config
+        )
 
         logger.info(
-            "Telegram application stopped."
+            "LEX IBAN Bot is ready."
         )
 
-    except Exception as error:
+        # This blocks until Render/Uvicorn
+        # asks the process to shut down.
+        await server.serve()
 
-        logger.exception(
-            "Telegram application stop error: %s",
-            error
-        )
+    finally:
 
-    try:
-
-        await telegram_app.shutdown()
+        # -------------------------------------------------
+        # GRACEFUL SHUTDOWN
+        # -------------------------------------------------
 
         logger.info(
-            "Telegram application shutdown complete."
+            "Graceful shutdown started..."
         )
 
-    except Exception as error:
+        if telegram_app:
 
-        logger.exception(
-            "Telegram application shutdown error: %s",
-            error
+            try:
+
+                await telegram_app.bot.delete_webhook(
+                    drop_pending_updates=False
+                )
+
+                logger.info(
+                    "Webhook removed."
+                )
+
+            except Exception as error:
+
+                logger.warning(
+                    "Webhook cleanup failed: %s",
+                    error
+                )
+
+            try:
+
+                if telegram_app.running:
+
+                    await telegram_app.stop()
+
+                logger.info(
+                    "Telegram application stopped."
+                )
+
+            except Exception as error:
+
+                logger.warning(
+                    "Telegram stop failed: %s",
+                    error
+                )
+
+            try:
+
+                await telegram_app.shutdown()
+
+                logger.info(
+                    "Telegram application shutdown complete."
+                )
+
+            except Exception as error:
+
+                logger.warning(
+                    "Telegram shutdown failed: %s",
+                    error
+                )
+
+        telegram_app = None
+
+        logger.info(
+            "Graceful shutdown completed."
         )
-
-    telegram_app = None
-
-    logger.info(
-        "Graceful shutdown completed."
-    )
 
 
 # =========================================================
@@ -1333,18 +1344,22 @@ async def shutdown():
 
 if __name__ == "__main__":
 
-    import uvicorn
+    try:
 
-    logger.info(
-        "Starting Uvicorn on port %s",
-        PORT
-    )
+        asyncio.run(
+            run_server()
+        )
 
-    uvicorn.run(
-        web_app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info",
-        proxy_headers=True,
-        forwarded_allow_ips="*",
-        ) 
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Process interrupted by user."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Fatal application error."
+        )
+
+        raise
