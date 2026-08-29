@@ -46,6 +46,8 @@ BASE_URL = (
     "https://www.ibancalculator.com/validate/"
 )
 
+DELETE_AFTER_SECONDS = 10
+
 logging.basicConfig(
     format=(
         "%(asctime)s - %(name)s - "
@@ -66,7 +68,6 @@ application = None
 # =========================================================
 
 def clean_iban(value: str) -> str:
-
     return re.sub(
         r"[^A-Z0-9]",
         "",
@@ -75,7 +76,6 @@ def clean_iban(value: str) -> str:
 
 
 def extract_ibans(text: str):
-
     found = []
 
     pattern = (
@@ -87,7 +87,6 @@ def extract_ibans(text: str):
         pattern,
         text.upper()
     ):
-
         iban = clean_iban(match)
 
         if (
@@ -98,7 +97,6 @@ def extract_ibans(text: str):
             )
             and iban not in found
         ):
-
             found.append(iban)
 
     for word in text.split():
@@ -113,22 +111,16 @@ def extract_ibans(text: str):
             )
             and iban not in found
         ):
-
             found.append(iban)
 
     return found
 
 
-def iban_checksum_valid(
-    iban: str
-) -> bool:
+def iban_checksum_valid(iban: str) -> bool:
 
     try:
 
-        rearranged = (
-            iban[4:]
-            + iban[:4]
-        )
+        rearranged = iban[4:] + iban[:4]
 
         numeric = ""
 
@@ -172,9 +164,7 @@ def iban_checksum_valid(
 # HTML PARSING
 # =========================================================
 
-def get_clean_soup(
-    html: str
-):
+def get_clean_soup(html: str):
 
     soup = BeautifulSoup(
         html,
@@ -189,7 +179,6 @@ def get_clean_soup(
             "svg"
         ]
     ):
-
         tag.decompose()
 
     return soup
@@ -202,7 +191,7 @@ def clean_value(value):
         return None
 
     value = re.sub(
-        r"\s+",
+        r"[ \t]+",
         " ",
         value
     ).strip()
@@ -257,7 +246,7 @@ def is_bad_value(value):
 
 
 # =========================================================
-# GENERIC LABEL VALUE
+# LABEL / VALUE EXTRACTION
 # =========================================================
 
 def get_label_value(
@@ -405,7 +394,7 @@ def get_label_value(
                     return value
 
     # -----------------------------------------------------
-    # LABEL: VALUE
+    # EXACT LABEL: VALUE
     # -----------------------------------------------------
 
     for element in soup.find_all(
@@ -459,9 +448,7 @@ def get_label_value(
 # BANK
 # =========================================================
 
-def extract_bank(
-    soup
-):
+def extract_bank(soup):
 
     value = get_label_value(
         soup,
@@ -487,9 +474,7 @@ def extract_bank(
 # BIC / SWIFT
 # =========================================================
 
-def extract_bic(
-    soup
-):
+def extract_bic(soup):
 
     value = get_label_value(
         soup,
@@ -529,9 +514,7 @@ def extract_bic(
 # BRANCH
 # =========================================================
 
-def extract_branch(
-    soup
-):
+def extract_branch(soup):
 
     value = get_label_value(
         soup,
@@ -553,12 +536,10 @@ def extract_branch(
 # ADDRESS
 # =========================================================
 
-def extract_address(
-    soup
-):
+def extract_address(soup):
 
     # -----------------------------------------------------
-    # FIRST: DIRECT ADDRESS LABEL
+    # 1. DIRECT ADDRESS FIELD
     # -----------------------------------------------------
 
     value = get_label_value(
@@ -568,6 +549,7 @@ def extract_address(
             "Bank address",
             "Bank Address",
             "Adresse",
+            "Bankadresse",
             "Adresse der Bank",
         ]
     )
@@ -577,7 +559,7 @@ def extract_address(
         return value
 
     # -----------------------------------------------------
-    # SECOND: SEARCH AROUND BANK NAME
+    # 2. SEARCH AFTER BANK NAME
     # -----------------------------------------------------
 
     bank = extract_bank(
@@ -587,9 +569,6 @@ def extract_address(
     if not bank:
 
         return None
-
-    # Keep original HTML elements
-    # so line breaks can be recovered.
 
     elements = soup.find_all(
         [
@@ -634,7 +613,6 @@ def extract_address(
 
             low = text.lower()
 
-            # Stop when bank service information starts
             if (
                 "sepa credit transfer"
                 in low
@@ -658,7 +636,6 @@ def extract_address(
 
                 continue
 
-            # Avoid accidentally taking page headings
             if len(text) > 180:
 
                 continue
@@ -675,19 +652,10 @@ def extract_address(
 
 
 # =========================================================
-# ADDRESS - STRONGER FALLBACK
+# ADDRESS FALLBACK
 # =========================================================
 
-def extract_address_fallback(
-    soup
-):
-
-    address_patterns = [
-        r"\b\d{1,5}\s+[A-ZÀ-ÿ][^,]{2,80}",
-        r"\b\d{1,5}\s+(?:bis\s+)?rue\b[^<]{0,100}",
-        r"\b\d{1,5}\s+avenue\b[^<]{0,100}",
-        r"\b\d{1,5}\s+boulevard\b[^<]{0,100}",
-    ]
+def extract_address_fallback(soup):
 
     text = soup.get_text(
         "\n",
@@ -698,7 +666,7 @@ def extract_address_fallback(
 
     for line in text.splitlines():
 
-        line = clean_value(line)
+        line = line.strip()
 
         if not line:
 
@@ -725,17 +693,15 @@ def extract_address_fallback(
 
             continue
 
-        for pattern in address_patterns:
+        # Common address indicators
+        if re.search(
+            r"\b\d{1,5}\s+",
+            line
+        ):
 
-            if re.search(
-                pattern,
-                line,
-                re.IGNORECASE
-            ):
+            if len(line) <= 180:
 
                 lines.append(line)
-
-                break
 
     if lines:
 
@@ -746,13 +712,7 @@ def extract_address_fallback(
     return None
 
 
-# =========================================================
-# FINAL ADDRESS EXTRACTION
-# =========================================================
-
-def get_address(
-    soup
-):
+def get_address(soup):
 
     address = extract_address(
         soup
@@ -768,7 +728,7 @@ def get_address(
 
 
 # =========================================================
-# SEPA SUPPORT
+# SEPA
 # =========================================================
 
 def detect_support(
@@ -793,7 +753,7 @@ def detect_support(
             phrase.lower()
         )
 
-        # Supported
+        # English positive
         if re.search(
             p
             + r"\s+(?:is\s+)?supported\b",
@@ -803,7 +763,7 @@ def detect_support(
 
             return True
 
-        # Not supported
+        # English negative
         if re.search(
             p
             + r"\s+(?:is\s+)?not\s+supported\b",
@@ -903,32 +863,20 @@ def parse_result(
         result["valid"] = False
 
     # -----------------------------------------------------
-    # BANK
+    # BANK DATA
     # -----------------------------------------------------
 
     result["bank"] = extract_bank(
         soup
     )
 
-    # -----------------------------------------------------
-    # BIC
-    # -----------------------------------------------------
-
     result["bic"] = extract_bic(
         soup
     )
 
-    # -----------------------------------------------------
-    # BRANCH
-    # -----------------------------------------------------
-
     result["branch"] = extract_branch(
         soup
     )
-
-    # -----------------------------------------------------
-    # ADDRESS
-    # -----------------------------------------------------
 
     result["address"] = get_address(
         soup
@@ -970,7 +918,7 @@ def parse_result(
 
 
 # =========================================================
-# IBAN WEBSITE REQUEST
+# IBAN REQUEST
 # =========================================================
 
 async def check_iban(
@@ -1001,12 +949,16 @@ async def check_iban(
 
     try:
 
+        timeout = aiohttp.ClientTimeout(
+            total=30,
+            connect=10,
+            sock_read=25
+        )
+
         async with session.get(
             url,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(
-                total=30
-            ),
+            timeout=timeout,
             allow_redirects=True
         ) as response:
 
@@ -1053,9 +1005,7 @@ async def check_iban(
 # RESULT FORMAT
 # =========================================================
 
-def support_text(
-    value
-):
+def support_text(value):
 
     if value is True:
 
@@ -1068,9 +1018,7 @@ def support_text(
     return "Unknown"
 
 
-def format_result(
-    data
-):
+def format_result(data):
 
     iban = escape(
         data.get("iban", "")
@@ -1111,15 +1059,11 @@ def format_result(
             data["iban"]
         ):
 
-            status = (
-                "Technically valid"
-            )
+            status = "Technically valid"
 
         else:
 
-            status = (
-                "Technically invalid"
-            )
+            status = "Technically invalid"
 
     # -----------------------------------------------------
     # BANK
@@ -1140,18 +1084,12 @@ def format_result(
     )
 
     # -----------------------------------------------------
-    # BRANCH
-    # -----------------------------------------------------
-
-    branch = escape(
-        data.get("branch")
-        or "Not available"
-    )
-
-    # -----------------------------------------------------
     # ADDRESS
     # -----------------------------------------------------
 
+    # IMPORTANT:
+    # Do NOT convert \n to <br>.
+    # Telegram HTML does not support <br>.
     address = (
         data.get("address")
         or "Not available"
@@ -1159,9 +1097,15 @@ def format_result(
 
     address = escape(
         address
-    ).replace(
-        "\n",
-        "<br>"
+    )
+
+    # -----------------------------------------------------
+    # BRANCH
+    # -----------------------------------------------------
+
+    branch = escape(
+        data.get("branch")
+        or "Not available"
     )
 
     # -----------------------------------------------------
@@ -1219,56 +1163,69 @@ async def delete_messages_after_delay(
     result_message
 ):
 
-    # Wait exactly 10 seconds
-    await asyncio.sleep(10)
-
-    # -----------------------------------------------------
-    # DELETE USER IBAN MESSAGE
-    # -----------------------------------------------------
-
     try:
 
-        await user_message.delete()
+        await asyncio.sleep(
+            DELETE_AFTER_SECONDS
+        )
+
+        # -------------------------------------------------
+        # DELETE USER IBAN MESSAGE
+        # -------------------------------------------------
+
+        try:
+
+            await user_message.delete()
+
+            logger.info(
+                "Deleted message %s from chat %s",
+                user_message.message_id,
+                user_message.chat_id
+            )
+
+        except Exception as error:
+
+            logger.warning(
+                "Could not delete user message "
+                "%s: %s",
+                user_message.message_id,
+                error
+            )
+
+        # -------------------------------------------------
+        # DELETE BOT RESULT
+        # -------------------------------------------------
+
+        try:
+
+            await result_message.delete()
+
+            logger.info(
+                "Deleted message %s from chat %s",
+                result_message.message_id,
+                result_message.chat_id
+            )
+
+        except Exception as error:
+
+            logger.warning(
+                "Could not delete bot result "
+                "%s: %s",
+                result_message.message_id,
+                error
+            )
+
+    except asyncio.CancelledError:
 
         logger.info(
-            "Deleted message %s from chat %s",
-            user_message.message_id,
-            user_message.chat_id
+            "Delete task cancelled during shutdown."
         )
 
-    except Exception as error:
-
-        logger.warning(
-            "Could not delete user message %s: %s",
-            user_message.message_id,
-            error
-        )
-
-    # -----------------------------------------------------
-    # DELETE BOT RESULT
-    # -----------------------------------------------------
-
-    try:
-
-        await result_message.delete()
-
-        logger.info(
-            "Deleted message %s from chat %s",
-            result_message.message_id,
-            result_message.chat_id
-        )
-
-    except Exception as error:
-
-        logger.warning(
-            "Could not delete result message %s: %s",
-            result_message.message_id,
-            error
-        )
+        raise
 
 
 # =========================================================
-# TELEGRAM HANDLER
+# TELEGRAM MESSAGE HANDLER
 # =========================================================
 
 async def handle_message(
@@ -1285,6 +1242,10 @@ async def handle_message(
         or ""
     ).strip()
 
+    # -----------------------------------------------------
+    # EXTRACT IBANS
+    # -----------------------------------------------------
+
     ibans = extract_ibans(
         text
     )
@@ -1295,62 +1256,123 @@ async def handle_message(
 
     if not ibans:
 
-        await update.message.reply_text(
-            "❌ No valid IBAN found."
-        )
+        try:
+
+            await update.message.reply_text(
+                "❌ No valid IBAN found."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to send no-IBAN message."
+            )
 
         return
 
     # -----------------------------------------------------
-    # MAX 10
+    # MAXIMUM
     # -----------------------------------------------------
 
     if len(ibans) > 10:
 
-        await update.message.reply_text(
-            "❌ Maximum 10 IBANs per message."
-        )
+        try:
+
+            await update.message.reply_text(
+                "❌ Maximum 10 IBANs per message."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to send maximum message."
+            )
 
         return
 
-    # Keep original message reference
+    # Save original user message
     user_message = update.message
 
     # -----------------------------------------------------
     # WAIT MESSAGE
     # -----------------------------------------------------
 
-    wait_message = (
-        await update.message.reply_text(
-            f"⏳ Checking "
-            f"{len(ibans)} IBAN(s)..."
+    try:
+
+        wait_message = (
+            await update.message.reply_text(
+                f"⏳ Checking "
+                f"{len(ibans)} IBAN(s)..."
+            )
         )
+
+    except Exception:
+
+        logger.exception(
+            "Failed to send waiting message."
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # REQUEST SESSION
+    # -----------------------------------------------------
+
+    connector = aiohttp.TCPConnector(
+        limit=5,
+        ttl_dns_cache=300
     )
 
-    # -----------------------------------------------------
-    # CHECK IBANS
-    # -----------------------------------------------------
+    timeout = aiohttp.ClientTimeout(
+        total=35
+    )
 
-    async with aiohttp.ClientSession() as session:
+    try:
 
-        results = []
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout
+        ) as session:
 
-        for iban in ibans:
+            results = []
 
-            result = await check_iban(
-                session,
-                iban
+            for iban in ibans:
+
+                result = await check_iban(
+                    session,
+                    iban
+                )
+
+                results.append(
+                    format_result(result)
+                )
+
+                # Avoid hammering source
+                await asyncio.sleep(1)
+
+    except Exception as error:
+
+        logger.exception(
+            "Processing failed: %s",
+            error
+        )
+
+        try:
+
+            await wait_message.edit_text(
+                "⚠️ An error occurred while "
+                "checking the IBAN.",
+                parse_mode="HTML"
             )
 
-            results.append(
-                format_result(result)
-            )
+        except Exception:
 
-            # Small delay between requests
-            await asyncio.sleep(1)
+            pass
+
+        return
 
     # -----------------------------------------------------
-    # JOIN RESULTS
+    # COMBINE RESULTS
     # -----------------------------------------------------
 
     final_text = (
@@ -1358,7 +1380,7 @@ async def handle_message(
         "━━━━━━━━━━━━━━━━━━━━\n\n"
     ).join(results)
 
-    # Telegram message limit
+    # Telegram HTML message limit
     if len(final_text) > 4000:
 
         final_text = (
@@ -1395,7 +1417,6 @@ async def handle_message(
                 )
             )
 
-            # Delete old waiting message
             try:
 
                 await wait_message.delete()
@@ -1413,7 +1434,7 @@ async def handle_message(
             return
 
     # -----------------------------------------------------
-    # DELETE BOTH AFTER 10 SECONDS
+    # DELETE AFTER 10 SECONDS
     # -----------------------------------------------------
 
     asyncio.create_task(
@@ -1425,7 +1446,7 @@ async def handle_message(
 
 
 # =========================================================
-# WEBHOOK
+# TELEGRAM WEBHOOK
 # =========================================================
 
 async def telegram_webhook(
@@ -1444,7 +1465,7 @@ async def telegram_webhook(
         )
 
     # -----------------------------------------------------
-    # SECRET CHECK
+    # SECRET
     # -----------------------------------------------------
 
     if WEBHOOK_SECRET:
@@ -1459,7 +1480,7 @@ async def telegram_webhook(
         if received_secret != WEBHOOK_SECRET:
 
             logger.warning(
-                "Invalid webhook secret."
+                "Invalid Telegram webhook secret."
             )
 
             return PlainTextResponse(
@@ -1470,12 +1491,27 @@ async def telegram_webhook(
             )
 
     # -----------------------------------------------------
-    # RECEIVE UPDATE
+    # JSON
     # -----------------------------------------------------
 
     try:
 
         data = await request.json()
+
+    except Exception:
+
+        return PlainTextResponse(
+            "Invalid JSON",
+            status_code=(
+                HTTPStatus.BAD_REQUEST
+            )
+        )
+
+    # -----------------------------------------------------
+    # UPDATE
+    # -----------------------------------------------------
+
+    try:
 
         update = Update.de_json(
             data=data,
@@ -1494,7 +1530,7 @@ async def telegram_webhook(
     except Exception as error:
 
         logger.exception(
-            "Webhook error: %s",
+            "Webhook processing error: %s",
             error
         )
 
@@ -1531,7 +1567,7 @@ async def root(
 
 
 # =========================================================
-# STARLETTE APP
+# STARLETTE
 # =========================================================
 
 web_app = Starlette(
@@ -1564,7 +1600,7 @@ async def run_server():
     global application
 
     # -----------------------------------------------------
-    # ENV CHECK
+    # ENVIRONMENT CHECK
     # -----------------------------------------------------
 
     if not TOKEN:
@@ -1586,11 +1622,6 @@ async def run_server():
 
     logger.info(
         "Starting LEX IBAN Bot..."
-    )
-
-    logger.info(
-        "Render URL: %s",
-        RENDER_EXTERNAL_URL
     )
 
     logger.info(
@@ -1640,7 +1671,7 @@ async def run_server():
     try:
 
         # -------------------------------------------------
-        # WEBHOOK CONFIG
+        # SET WEBHOOK
         # -------------------------------------------------
 
         webhook_kwargs = {
@@ -1662,11 +1693,11 @@ async def run_server():
         )
 
         logger.info(
-            "Telegram webhook configured successfully."
+            "Telegram webhook configured."
         )
 
         # -------------------------------------------------
-        # VERIFY WEBHOOK
+        # CHECK WEBHOOK
         # -------------------------------------------------
 
         webhook_info = (
@@ -1674,7 +1705,7 @@ async def run_server():
         )
 
         logger.info(
-            "Telegram webhook active: %s",
+            "Active webhook: %s",
             webhook_info.url
         )
 
@@ -1709,12 +1740,12 @@ async def run_server():
         )
 
         logger.info(
-            "Health endpoint: %s/health",
+            "Health: %s/health",
             RENDER_EXTERNAL_URL.rstrip("/")
         )
 
         # -------------------------------------------------
-        # RUN UNTIL RENDER STOPS PROCESS
+        # RUN
         # -------------------------------------------------
 
         await server.serve()
@@ -1753,7 +1784,7 @@ async def run_server():
                 )
 
             # ---------------------------------------------
-            # STOP APPLICATION
+            # STOP
             # ---------------------------------------------
 
             try:
@@ -1769,12 +1800,12 @@ async def run_server():
             except Exception as error:
 
                 logger.warning(
-                    "Telegram application stop failed: %s",
+                    "Application stop failed: %s",
                     error
                 )
 
             # ---------------------------------------------
-            # SHUTDOWN APPLICATION
+            # SHUTDOWN
             # ---------------------------------------------
 
             try:
@@ -1788,7 +1819,7 @@ async def run_server():
             except Exception as error:
 
                 logger.warning(
-                    "Telegram application shutdown failed: %s",
+                    "Application shutdown failed: %s",
                     error
                 )
 
