@@ -101,6 +101,7 @@ def extract_ibans(text: str):
 def iban_checksum_valid(iban: str) -> bool:
 
     try:
+
         rearranged = iban[4:] + iban[:4]
 
         numeric = ""
@@ -108,14 +109,17 @@ def iban_checksum_valid(iban: str) -> bool:
         for char in rearranged:
 
             if char.isdigit():
+
                 numeric += char
 
             elif char.isalpha():
+
                 numeric += str(
                     ord(char) - 55
                 )
 
             else:
+
                 return False
 
         remainder = 0
@@ -125,6 +129,7 @@ def iban_checksum_valid(iban: str) -> bool:
             len(numeric),
             7
         ):
+
             remainder = int(
                 str(remainder)
                 + numeric[i:i + 7]
@@ -133,6 +138,7 @@ def iban_checksum_valid(iban: str) -> bool:
         return remainder == 1
 
     except Exception:
+
         return False
 
 
@@ -192,6 +198,8 @@ def is_bad_value(value):
         "not found",
         "not available",
         "unknown",
+        "n/a",
+        "na",
         "nicht verfügbar",
         "nicht gefunden",
     }
@@ -217,17 +225,31 @@ def is_bad_value(value):
     return False
 
 
+def normalize_text(value):
+
+    if not value:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip().lower()
+
+
 def get_label_value(
     soup,
     labels
 ):
 
     labels_lower = {
-        item.lower().strip()
+        normalize_text(item).rstrip(":")
         for item in labels
     }
 
-    # Table extraction
+    # =====================================================
+    # TABLE
+    # =====================================================
 
     for row in soup.find_all("tr"):
 
@@ -248,10 +270,11 @@ def get_label_value(
         if not label:
             continue
 
-        if (
-            label.lower().rstrip(":")
-            in labels_lower
-        ):
+        label_normalized = normalize_text(
+            label
+        ).rstrip(":")
+
+        if label_normalized in labels_lower:
 
             value = clean_value(
                 cells[1].get_text(
@@ -261,9 +284,12 @@ def get_label_value(
             )
 
             if not is_bad_value(value):
+
                 return value
 
-    # Definition list extraction
+    # =====================================================
+    # DEFINITION LIST
+    # =====================================================
 
     for element in soup.find_all(
         ["label", "dt"]
@@ -279,10 +305,11 @@ def get_label_value(
         if not label:
             continue
 
-        if (
-            label.lower().rstrip(":")
-            not in labels_lower
-        ):
+        label_normalized = normalize_text(
+            label
+        ).rstrip(":")
+
+        if label_normalized not in labels_lower:
             continue
 
         sibling = element.find_next_sibling()
@@ -297,9 +324,12 @@ def get_label_value(
             )
 
             if not is_bad_value(value):
+
                 return value
 
-    # Strong / bold labels
+    # =====================================================
+    # STRONG / BOLD
+    # =====================================================
 
     for element in soup.find_all(
         ["strong", "b"]
@@ -315,10 +345,11 @@ def get_label_value(
         if not label:
             continue
 
-        if (
-            label.lower().rstrip(":")
-            not in labels_lower
-        ):
+        label_normalized = normalize_text(
+            label
+        ).rstrip(":")
+
+        if label_normalized not in labels_lower:
             continue
 
         parent = element.parent
@@ -342,12 +373,15 @@ def get_label_value(
                 )
 
                 if not is_bad_value(value):
+
                     return value
 
-    # Exact label:value extraction
+    # =====================================================
+    # DIRECT LABEL: VALUE
+    # =====================================================
 
     for element in soup.find_all(
-        ["p", "div", "li", "span"]
+        ["p", "div", "li", "span", "td"]
     ):
 
         text = clean_value(
@@ -381,13 +415,14 @@ def get_label_value(
                 )
 
                 if not is_bad_value(value):
+
                     return value
 
     return None
 
 
 # =========================================================
-# BANK DATA
+# BANK
 # =========================================================
 
 def extract_bank(soup):
@@ -405,11 +440,50 @@ def extract_bank(soup):
         ]
     )
 
-    if is_bad_value(value):
-        return None
+    if not is_bad_value(value):
 
-    return value
+        return value
 
+    # =====================================================
+    # FALLBACK: Bank: XXXXX
+    # =====================================================
+
+    for element in soup.find_all(
+        ["p", "div", "td", "li", "span"]
+    ):
+
+        text = clean_value(
+            element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not text:
+            continue
+
+        match = re.match(
+            r"^Bank\s*:\s*(.+)$",
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            value = clean_value(
+                match.group(1)
+            )
+
+            if not is_bad_value(value):
+
+                return value
+
+    return None
+
+
+# =========================================================
+# BIC / SWIFT
+# =========================================================
 
 def extract_bic(soup):
 
@@ -418,31 +492,56 @@ def extract_bic(soup):
         [
             "BIC",
             "BIC/SWIFT",
+            "BIC / SWIFT",
             "SWIFT",
+            "SWIFT/BIC",
         ]
     )
 
-    if not value:
-        return None
+    if value:
 
-    match = re.search(
-        r"\b[A-Z0-9]{8}(?:[A-Z0-9]{3})?\b",
-        value.upper()
+        match = re.search(
+            r"\b[A-Z0-9]{8}(?:[A-Z0-9]{3})?\b",
+            value.upper()
+        )
+
+        if match:
+
+            bic = match.group(0)
+
+            if re.search(
+                r"[A-Z]",
+                bic
+            ):
+
+                return bic
+
+    # =====================================================
+    # FALLBACK: search complete page for BIC
+    # =====================================================
+
+    text = soup.get_text(
+        " ",
+        strip=True
     )
 
-    if not match:
-        return None
+    matches = re.findall(
+        r"\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b",
+        text.upper()
+    )
 
-    bic = match.group(0)
+    for bic in matches:
 
-    if not re.search(
-        r"[A-Z]",
-        bic
-    ):
-        return None
+        if len(bic) in (8, 11):
 
-    return bic
+            return bic
 
+    return None
+
+
+# =========================================================
+# BRANCH
+# =========================================================
 
 def extract_branch(soup):
 
@@ -452,16 +551,62 @@ def extract_branch(soup):
             "Branch number",
             "Branch Number",
             "Branch",
+            "Branch code",
+            "Branch Code",
         ]
     )
 
-    if is_bad_value(value):
-        return None
+    if not is_bad_value(value):
 
-    return value
+        return value
 
+    # =====================================================
+    # FALLBACK
+    # =====================================================
+
+    for element in soup.find_all(
+        ["p", "div", "td", "li", "span"]
+    ):
+
+        text = clean_value(
+            element.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not text:
+            continue
+
+        match = re.match(
+            r"^(?:Branch|Branch Number|Branch Code)"
+            r"\s*:\s*(.+)$",
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            value = clean_value(
+                match.group(1)
+            )
+
+            if not is_bad_value(value):
+
+                return value
+
+    return None
+
+
+# =========================================================
+# ADDRESS
+# =========================================================
 
 def extract_address(soup):
+
+    # =====================================================
+    # 1. Explicit Address
+    # =====================================================
 
     value = get_label_value(
         soup,
@@ -469,10 +614,14 @@ def extract_address(soup):
             "Address",
             "Bank address",
             "Bank Address",
+            "Bankaddress",
+            "Adresse",
+            "Bankadresse",
         ]
     )
 
     if not is_bad_value(value):
+
         return value
 
     bank = extract_bank(soup)
@@ -480,12 +629,20 @@ def extract_address(soup):
     if not bank:
         return None
 
+    bank_normalized = normalize_text(
+        bank
+    )
+
+    # =====================================================
+    # 2. Search elements
+    # =====================================================
+
     elements = soup.find_all(
         [
-            "p",
-            "div",
             "td",
-            "li"
+            "p",
+            "li",
+            "div"
         ]
     )
 
@@ -498,13 +655,25 @@ def extract_address(soup):
             )
         )
 
-        if current != bank:
+        if not current:
             continue
 
-        possible = []
+        current_normalized = normalize_text(
+            current
+        )
+
+        # Exact bank match
+        if current_normalized != bank_normalized:
+            continue
+
+        address_lines = []
+
+        # =================================================
+        # Look at next elements
+        # =================================================
 
         for next_element in elements[
-            i + 1:i + 5
+            i + 1:i + 10
         ]:
 
             text = clean_value(
@@ -519,29 +688,128 @@ def extract_address(soup):
 
             low = text.lower()
 
+            # Stop at next major section
             if (
-                "sepa credit transfer"
-                in low
-                or "sepa direct debit"
-                in low
-                or "sepa instant"
-                in low
-                or "b2b"
-                in low
-                or "branch number"
-                in low
+                "sepa credit transfer" in low
+                or "sepa direct debit" in low
+                or "sepa instant credit transfer" in low
+                or "instant credit transfer" in low
+                or low == "b2b"
+                or low.startswith("b2b ")
+                or "branch number" in low
+                or low.startswith("branch:")
+                or low.startswith("bic:")
+                or low.startswith("bic/swift:")
+                or low.startswith("swift:")
             ):
                 break
 
-            if text == bank:
+            # Ignore duplicate bank
+            if normalize_text(text) == bank_normalized:
                 continue
 
-            possible.append(text)
+            # Ignore BIC
+            if re.fullmatch(
+                r"[A-Z0-9]{8}(?:[A-Z0-9]{3})?",
+                text.upper()
+            ):
+                continue
 
-        if possible:
+            # Ignore common labels
+            if low.rstrip(":") in {
+                "bank",
+                "bank name",
+                "address",
+                "bank address",
+                "bic",
+                "bic/swift",
+                "swift",
+                "branch",
+                "branch number",
+                "branch code",
+            }:
+                continue
+
+            # Ignore generic interface text
+            if low in {
+                "copy",
+                "copy to clipboard",
+                "validate another iban",
+                "validate iban",
+                "check another iban",
+            }:
+                continue
+
+            # Avoid taking very long sections
+            if len(text) > 180:
+                continue
+
+            address_lines.append(text)
+
+            if len(address_lines) >= 3:
+                break
+
+        if address_lines:
+
             return "\n".join(
-                possible[:3]
+                address_lines
             )
+
+    # =====================================================
+    # 3. Search for typical address patterns
+    # =====================================================
+
+    all_text = soup.get_text(
+        "\n",
+        strip=True
+    )
+
+    lines = [
+        clean_value(line)
+        for line in all_text.splitlines()
+    ]
+
+    lines = [
+        line
+        for line in lines
+        if line
+    ]
+
+    # Common Belgian postal-code pattern
+    postal_pattern = re.compile(
+        r"\b\d{4,5}\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]+\b"
+    )
+
+    for index, line in enumerate(lines):
+
+        if postal_pattern.search(line):
+
+            previous = []
+
+            for p in range(
+                max(0, index - 2),
+                index
+            ):
+
+                candidate = lines[p]
+
+                if (
+                    candidate.lower()
+                    != bank_normalized
+                    and len(candidate) < 180
+                ):
+
+                    previous.append(
+                        candidate
+                    )
+
+            address = previous + [line]
+
+            if address:
+
+                return "\n".join(
+                    address[-3:]
+                )
 
     return None
 
@@ -572,17 +840,9 @@ def detect_support(
             phrase.lower()
         )
 
-        # English: supported
-
-        if re.search(
-            p
-            + r"\s+(?:is\s+)?supported\b",
-            text,
-            re.IGNORECASE
-        ):
-            return True
-
-        # English: not supported
+        # Not supported FIRST
+        # This prevents "supported" from
+        # incorrectly matching "not supported".
 
         if re.search(
             p
@@ -590,28 +850,37 @@ def detect_support(
             text,
             re.IGNORECASE
         ):
-            return False
 
-        # German: not supported
+            return False
 
         if re.search(
             p
-            + r".{0,40}"
+            + r".{0,50}"
             + r"(nicht unterstützt|nicht unterstuetzt)",
             text,
             re.IGNORECASE
         ):
+
             return False
 
-        # German: supported
+        # Supported
+        if re.search(
+            p
+            + r"\s+(?:is\s+)?supported\b",
+            text,
+            re.IGNORECASE
+        ):
+
+            return True
 
         if re.search(
             p
-            + r".{0,40}"
+            + r".{0,50}"
             + r"(unterstützt|unterstuetzt)",
             text,
             re.IGNORECASE
         ):
+
             return True
 
     return None
@@ -651,6 +920,10 @@ def parse_result(
         "instant": None,
     }
 
+    # =====================================================
+    # VALIDITY
+    # =====================================================
+
     if (
         "this is a valid iban"
         in lower
@@ -658,9 +931,12 @@ def parse_result(
         in lower
         or "is a valid iban"
         in lower
+        or "valid iban"
+        in lower
         or "dies ist eine gültige iban"
         in lower
     ):
+
         result["valid"] = True
 
     elif (
@@ -670,10 +946,17 @@ def parse_result(
         in lower
         or "this is an invalid iban"
         in lower
+        or "invalid iban"
+        in lower
         or "dies ist keine gültige iban"
         in lower
     ):
+
         result["valid"] = False
+
+    # =====================================================
+    # BANK DATA
+    # =====================================================
 
     result["bank"] = extract_bank(
         soup
@@ -690,6 +973,10 @@ def parse_result(
     result["address"] = extract_address(
         soup
     )
+
+    # =====================================================
+    # SEPA
+    # =====================================================
 
     result["sepa"] = detect_support(
         soup,
@@ -715,7 +1002,8 @@ def parse_result(
     result["instant"] = detect_support(
         soup,
         [
-            "SEPA Instant Credit Transfer"
+            "SEPA Instant Credit Transfer",
+            "SEPA Instant",
         ]
     )
 
@@ -741,7 +1029,18 @@ async def check_iban(
             "(KHTML, like Gecko) "
             "Chrome/139.0 Safari/537.36"
         ),
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": (
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "image/avif,"
+            "image/webp,"
+            "*/*;q=0.8"
+        ),
+        "Accept-Language": (
+            "en-US,en;q=0.9"
+        ),
+        "Connection": "keep-alive",
     }
 
     try:
@@ -801,12 +1100,14 @@ async def check_iban(
 def support_text(value):
 
     if value is True:
+
         return "✅ Supported"
 
     if value is False:
+
         return "❌ Not supported"
 
-    return "❓ Unknown"
+    return "⚠️ Unknown"
 
 
 def format_result(data):
@@ -820,13 +1121,20 @@ def format_result(data):
         return (
             "📋 <b>IBAN Check Result</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
+
             f"🔢 <code>{iban}</code>\n\n"
+
             "⚠️ Unable to get the result.\n"
             f"• Reason: "
             f"{escape(data['error'])}\n\n"
+
             "━━━━━━━━━━━━━━━━━━━━\n"
             "By LEX"
         )
+
+    # =====================================================
+    # STATUS
+    # =====================================================
 
     if data.get("valid") is True:
 
@@ -841,24 +1149,43 @@ def format_result(data):
         if iban_checksum_valid(
             data["iban"]
         ):
+
             status = "Technically valid"
+
         else:
+
             status = "Technically invalid"
+
+    # =====================================================
+    # BANK
+    # =====================================================
 
     bank = escape(
         data.get("bank")
         or "Not available"
     )
 
+    # =====================================================
+    # BIC
+    # =====================================================
+
     bic = escape(
         data.get("bic")
         or "Not available"
     )
 
+    # =====================================================
+    # BRANCH
+    # =====================================================
+
     branch = escape(
         data.get("branch")
         or "Not available"
     )
+
+    # =====================================================
+    # ADDRESS
+    # =====================================================
 
     address = (
         data.get("address")
@@ -871,6 +1198,10 @@ def format_result(data):
         "\n",
         "<br>"
     )
+
+    # =====================================================
+    # COUNTRY
+    # =====================================================
 
     country = escape(
         data.get("country")
@@ -887,20 +1218,28 @@ def format_result(data):
         f"• Country: <b>{country}</b>\n\n"
 
         "🏦 <b>Bank Information</b>\n"
+
         f"• Bank: {bank}\n"
+
         f"• BIC/SWIFT: "
         f"<code>{bic}</code>\n"
+
         f"• Address: {address}\n"
+
         f"• Branch: "
         f"<code>{branch}</code>\n\n"
 
         "💶 <b>SEPA</b>\n"
+
         f"• SEPA Credit Transfer: "
         f"{support_text(data.get('sepa'))}\n"
+
         f"• SEPA Direct Debit: "
         f"{support_text(data.get('direct_debit'))}\n"
+
         f"• B2B: "
         f"{support_text(data.get('b2b'))}\n"
+
         f"• SEPA Instant Credit Transfer: "
         f"{support_text(data.get('instant'))}\n\n"
 
@@ -919,6 +1258,7 @@ async def handle_message(
 ):
 
     if not update.message:
+
         return
 
     text = (
@@ -1081,11 +1421,13 @@ async def run_server():
     global application
 
     if not TOKEN:
+
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is not set."
         )
 
     if not RENDER_EXTERNAL_URL:
+
         raise RuntimeError(
             "RENDER_EXTERNAL_URL is not set."
         )
@@ -1197,4 +1539,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         run_server()
-    ) 
+                ) 
