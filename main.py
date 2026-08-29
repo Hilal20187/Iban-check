@@ -15,6 +15,7 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ContextTypes,
@@ -37,6 +38,9 @@ WEBHOOK_SECRET = os.getenv(
 )
 
 BASE_URL = "https://www.ibancalculator.com/validate/"
+
+# Delete messages after 20 seconds
+DELETE_AFTER = 20
 
 
 # =========================================================
@@ -310,7 +314,7 @@ def get_label_value(
             return value
 
     # -----------------------------------------------------
-    # DT / DD
+    # DT / LABEL
     # -----------------------------------------------------
 
     for element in soup.find_all(
@@ -481,10 +485,6 @@ def extract_bank(soup):
 
         return value
 
-    # -----------------------------------------------------
-    # Fallback
-    # -----------------------------------------------------
-
     for element in soup.find_all(
         [
             "p",
@@ -552,10 +552,6 @@ def extract_bic(soup):
         if match:
 
             return match.group(0)
-
-    # -----------------------------------------------------
-    # Fallback: search entire page
-    # -----------------------------------------------------
 
     text = soup.get_text(
         " ",
@@ -645,7 +641,7 @@ def extract_branch(soup):
 def extract_address(soup):
 
     # -----------------------------------------------------
-    # 1. Explicit Address
+    # Explicit address field
     # -----------------------------------------------------
 
     value = get_label_value(
@@ -675,7 +671,7 @@ def extract_address(soup):
     )
 
     # -----------------------------------------------------
-    # 2. Search around bank name
+    # Search after bank name
     # -----------------------------------------------------
 
     elements = soup.find_all(
@@ -700,7 +696,9 @@ def extract_address(soup):
 
             continue
 
-        if normalize_text(current) != bank_normalized:
+        if normalize_text(
+            current
+        ) != bank_normalized:
 
             continue
 
@@ -721,9 +719,11 @@ def extract_address(soup):
 
                 continue
 
-            low = normalize_text(text)
+            low = normalize_text(
+                text
+            )
 
-            # Stop at another information section
+            # Stop at other sections
             if (
                 "sepa credit transfer" in low
                 or "sepa direct debit" in low
@@ -741,12 +741,12 @@ def extract_address(soup):
 
                 break
 
-            # Ignore duplicated bank
+            # Duplicate bank
             if low == bank_normalized:
 
                 continue
 
-            # Ignore BIC
+            # BIC
             if re.fullmatch(
                 r"[A-Z0-9]{8}(?:[A-Z0-9]{3})?",
                 text.upper()
@@ -754,7 +754,7 @@ def extract_address(soup):
 
                 continue
 
-            # Ignore labels
+            # Labels
             if low.rstrip(":") in {
                 "bank",
                 "bank name",
@@ -770,7 +770,7 @@ def extract_address(soup):
 
                 continue
 
-            # Ignore UI elements
+            # UI text
             if low in {
                 "copy",
                 "copy to clipboard",
@@ -781,7 +781,6 @@ def extract_address(soup):
 
                 continue
 
-            # Avoid grabbing huge page sections
             if len(text) > 180:
 
                 continue
@@ -801,7 +800,7 @@ def extract_address(soup):
             )
 
     # -----------------------------------------------------
-    # 3. Search for postal-code pattern
+    # Postal code fallback
     # -----------------------------------------------------
 
     page_text = soup.get_text(
@@ -813,7 +812,9 @@ def extract_address(soup):
 
     for line in page_text.splitlines():
 
-        line = clean_value(line)
+        line = clean_value(
+            line
+        )
 
         if line:
 
@@ -860,7 +861,7 @@ def extract_address(soup):
 
 
 # =========================================================
-# SEPA
+# SEPA SUPPORT
 # =========================================================
 
 def detect_support(
@@ -963,7 +964,7 @@ def parse_result(
     }
 
     # -----------------------------------------------------
-    # VALIDITY
+    # Validity
     # -----------------------------------------------------
 
     if (
@@ -987,32 +988,20 @@ def parse_result(
         result["valid"] = False
 
     # -----------------------------------------------------
-    # BANK
+    # Bank information
     # -----------------------------------------------------
 
     result["bank"] = extract_bank(
         soup
     )
 
-    # -----------------------------------------------------
-    # BIC
-    # -----------------------------------------------------
-
     result["bic"] = extract_bic(
         soup
     )
 
-    # -----------------------------------------------------
-    # BRANCH
-    # -----------------------------------------------------
-
     result["branch"] = extract_branch(
         soup
     )
-
-    # -----------------------------------------------------
-    # ADDRESS
-    # -----------------------------------------------------
 
     result["address"] = extract_address(
         soup
@@ -1177,7 +1166,7 @@ def format_result(data):
         )
 
     # -----------------------------------------------------
-    # STATUS
+    # Status
     # -----------------------------------------------------
 
     if data.get("valid") is True:
@@ -1201,7 +1190,7 @@ def format_result(data):
             status = "Technically invalid"
 
     # -----------------------------------------------------
-    # DATA
+    # Bank
     # -----------------------------------------------------
 
     bank = escape(
@@ -1211,12 +1200,20 @@ def format_result(data):
         )
     )
 
+    # -----------------------------------------------------
+    # BIC
+    # -----------------------------------------------------
+
     bic = escape(
         str(
             data.get("bic")
             or "Not available"
         )
     )
+
+    # -----------------------------------------------------
+    # Branch
+    # -----------------------------------------------------
 
     branch = escape(
         str(
@@ -1225,12 +1222,20 @@ def format_result(data):
         )
     )
 
+    # -----------------------------------------------------
+    # Country
+    # -----------------------------------------------------
+
     country = escape(
         str(
             data.get("country")
             or "Not available"
         )
     )
+
+    # -----------------------------------------------------
+    # Address
+    # -----------------------------------------------------
 
     address = data.get(
         "address"
@@ -1239,7 +1244,7 @@ def format_result(data):
     if address:
 
         # IMPORTANT:
-        # Telegram HTML supports newline \n.
+        # Telegram supports \n.
         # Do NOT use <br>.
 
         address = escape(
@@ -1251,7 +1256,7 @@ def format_result(data):
         address = "Not available"
 
     # -----------------------------------------------------
-    # FINAL MESSAGE
+    # Final message
     # -----------------------------------------------------
 
     return (
@@ -1295,6 +1300,57 @@ def format_result(data):
 
 
 # =========================================================
+# DELETE MESSAGES
+# =========================================================
+
+async def delete_messages_after_delay(
+    bot,
+    chat_id,
+    message_ids,
+    delay=DELETE_AFTER
+):
+
+    # Wait 20 seconds
+    await asyncio.sleep(
+        delay
+    )
+
+    for message_id in message_ids:
+
+        if not message_id:
+            continue
+
+        try:
+
+            await bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id
+            )
+
+            logger.info(
+                "Deleted message %s from chat %s",
+                message_id,
+                chat_id
+            )
+
+        except BadRequest as error:
+
+            logger.warning(
+                "Could not delete message %s: %s",
+                message_id,
+                error
+            )
+
+        except Exception as error:
+
+            logger.exception(
+                "Delete error for message %s: %s",
+                message_id,
+                error
+            )
+
+
+# =========================================================
 # TELEGRAM HANDLER
 # =========================================================
 
@@ -1312,31 +1368,56 @@ async def handle_message(
         or ""
     ).strip()
 
+    # -----------------------------------------------------
+    # Extract IBANs
+    # -----------------------------------------------------
+
     ibans = extract_ibans(
         text
     )
 
     if not ibans:
 
-        await update.message.reply_text(
-            "❌ No valid IBAN found."
-        )
-
         return
 
-    if len(ibans) > 10:
+    # -----------------------------------------------------
+    # Save user's message ID
+    # -----------------------------------------------------
 
-        await update.message.reply_text(
-            "❌ Maximum 10 IBANs per message."
-        )
-
-        return
-
-    wait_message = (
-        await update.message.reply_text(
-            f"⏳ Checking {len(ibans)} IBAN(s)..."
-        )
+    user_message_id = (
+        update.message.message_id
     )
+
+    chat_id = (
+        update.message.chat_id
+    )
+
+    # -----------------------------------------------------
+    # Start checking
+    # -----------------------------------------------------
+
+    wait_message = None
+
+    try:
+
+        wait_message = (
+            await update.message.reply_text(
+                f"⏳ Checking {len(ibans)} IBAN(s)..."
+            )
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Could not send checking message: %s",
+            error
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Check IBANs
+    # -----------------------------------------------------
 
     async with aiohttp.ClientSession() as session:
 
@@ -1375,10 +1456,16 @@ async def handle_message(
 
             await asyncio.sleep(1)
 
+    # -----------------------------------------------------
+    # Build final result
+    # -----------------------------------------------------
+
     final_text = (
         "\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-    ).join(results)
+    ).join(
+        results
+    )
 
     if len(final_text) > 4000:
 
@@ -1387,6 +1474,12 @@ async def handle_message(
             + "\n\n⚠️ Results truncated."
         )
 
+    # -----------------------------------------------------
+    # Edit checking message
+    # -----------------------------------------------------
+
+    bot_result_message_id = None
+
     try:
 
         await wait_message.edit_text(
@@ -1394,44 +1487,71 @@ async def handle_message(
             parse_mode="HTML"
         )
 
+        bot_result_message_id = (
+            wait_message.message_id
+        )
+
     except Exception as error:
 
         logger.exception(
-            "Telegram edit failed: %s",
+            "Could not edit result message: %s",
             error
         )
 
         try:
 
-            await update.message.reply_text(
-                final_text,
-                parse_mode="HTML"
+            result_message = (
+                await update.message.reply_text(
+                    final_text,
+                    parse_mode="HTML"
+                )
             )
+
+            bot_result_message_id = (
+                result_message.message_id
+            )
+
+            # Delete old checking message too
+            try:
+
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=wait_message.message_id
+                )
+
+            except Exception:
+
+                pass
 
         except Exception as error2:
 
             logger.exception(
-                "Telegram reply failed: %s",
+                "Could not send result message: %s",
                 error2
             )
 
-            # Last fallback:
-            # Send as plain text so the bot
-            # doesn't crash because of HTML.
+            return
 
-            plain_text = re.sub(
-                r"<[^>]+>",
-                "",
-                final_text
-            )
+    # -----------------------------------------------------
+    # DELETE USER MESSAGE + BOT RESULT
+    # AFTER 20 SECONDS
+    # -----------------------------------------------------
 
-            await update.message.reply_text(
-                plain_text
-            )
+    asyncio.create_task(
+        delete_messages_after_delay(
+            context.bot,
+            chat_id,
+            [
+                user_message_id,
+                bot_result_message_id,
+            ],
+            DELETE_AFTER
+        )
+    )
 
 
 # =========================================================
-# WEBHOOK
+# WEBHOOK SERVER
 # =========================================================
 
 application = None
@@ -1487,7 +1607,7 @@ async def telegram_webhook(
 
 
 # =========================================================
-# HEALTH
+# HEALTH CHECK
 # =========================================================
 
 async def health_check(
@@ -1511,12 +1631,16 @@ async def root(
 
 
 # =========================================================
-# SERVER
+# APPLICATION STARTUP
 # =========================================================
 
 async def run_server():
 
     global application
+
+    # -----------------------------------------------------
+    # Environment checks
+    # -----------------------------------------------------
 
     if not TOKEN:
 
@@ -1535,6 +1659,10 @@ async def run_server():
         + "/telegram"
     )
 
+    # -----------------------------------------------------
+    # Telegram application
+    # -----------------------------------------------------
+
     application = (
         Application.builder()
         .token(TOKEN)
@@ -1550,17 +1678,23 @@ async def run_server():
         )
     )
 
+    # -----------------------------------------------------
+    # Starlette routes
+    # -----------------------------------------------------
+
     routes = [
         Route(
             "/",
             root,
             methods=["GET"]
         ),
+
         Route(
             "/health",
             health_check,
             methods=["GET"]
         ),
+
         Route(
             "/telegram",
             telegram_webhook,
@@ -1571,6 +1705,10 @@ async def run_server():
     web_app = Starlette(
         routes=routes
     )
+
+    # -----------------------------------------------------
+    # Uvicorn
+    # -----------------------------------------------------
 
     config = uvicorn.Config(
         web_app,
@@ -1583,9 +1721,17 @@ async def run_server():
         config
     )
 
+    # -----------------------------------------------------
+    # Start
+    # -----------------------------------------------------
+
     async with application:
 
         await application.start()
+
+        # -------------------------------------------------
+        # Set Telegram webhook
+        # -------------------------------------------------
 
         if WEBHOOK_SECRET:
 
@@ -1611,6 +1757,11 @@ async def run_server():
         logger.info(
             "Webhook: %s",
             webhook_url
+        )
+
+        logger.info(
+            "Delete delay: %s seconds",
+            DELETE_AFTER
         )
 
         logger.info(
@@ -1645,4 +1796,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         run_server()
-        ) 
+            ) 
